@@ -1,0 +1,113 @@
+import sqlite3
+from pathlib import Path
+
+# Keep the database inside the project's data folder.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATABASE_PATH = DATA_DIR / "voicekirana.db"
+
+
+def get_connection():
+    """Open a database connection and return rows by column name."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def initialize_database():
+    """Create the tables required for multi-shop grocery ordering."""
+
+    schema = """
+    CREATE TABLE IF NOT EXISTS shops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1
+            CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        normalized_name TEXT NOT NULL,
+        brand TEXT,
+        variant TEXT,
+        base_unit TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        alias TEXT NOT NULL,
+        normalized_alias TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id)
+            REFERENCES products(id)
+            ON DELETE CASCADE,
+        UNIQUE (product_id, normalized_alias)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_product_aliases_normalized
+        ON product_aliases(normalized_alias);
+
+    CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        price_per_unit INTEGER NOT NULL CHECK (price_per_unit >= 0),
+        stock_quantity REAL NOT NULL DEFAULT 0
+            CHECK (stock_quantity >= 0),
+        is_available INTEGER NOT NULL DEFAULT 1
+            CHECK (is_available IN (0, 1)),
+        FOREIGN KEY (shop_id) REFERENCES shops(id),
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        UNIQUE (shop_id, product_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_reference TEXT NOT NULL UNIQUE,
+        shop_id INTEGER NOT NULL,
+        status TEXT NOT NULL
+            CHECK (status IN (
+                'pending',
+                'confirmed',
+                'cancelled'
+            )),
+        total_amount INTEGER NOT NULL DEFAULT 0
+            CHECK (total_amount >= 0),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (shop_id) REFERENCES shops(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity REAL NOT NULL CHECK (quantity > 0),
+        unit TEXT NOT NULL,
+        unit_price INTEGER NOT NULL CHECK (unit_price >= 0),
+        line_total INTEGER NOT NULL CHECK (line_total >= 0),
+        FOREIGN KEY (order_id) REFERENCES orders(id),
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_inventory_shop
+        ON inventory(shop_id);
+
+    CREATE INDEX IF NOT EXISTS idx_orders_shop_status
+        ON orders(shop_id, status);
+    """
+
+    with get_connection() as connection:
+        connection.executescript(schema)
+
+
+if __name__ == "__main__":
+    initialize_database()
+    print("VoiceKirana database initialized successfully.")
+    print(f"Database location: {DATABASE_PATH}")
