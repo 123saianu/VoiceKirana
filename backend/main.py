@@ -350,7 +350,7 @@ def confirm_order(
 
     with closing(get_connection()) as connection:
         with connection:
-            cursor = connection.execute(
+            order_id = connection.insert_returning_id(
                 """
                 INSERT INTO orders (
                     order_reference,
@@ -362,8 +362,6 @@ def confirm_order(
                 """,
                 (order_reference, shop_id, total_paise),
             )
-
-            order_id = cursor.lastrowid
 
             for item in checked_items:
                 connection.execute(

@@ -33,6 +33,17 @@ class DatabaseConnection:
 
         return self._connection.execute(sql, parameters)
 
+    def insert_returning_id(self, sql, parameters=()):
+        """Insert a row and return its generated primary key."""
+        if self._is_postgres:
+            sql = sql.rstrip().rstrip(";") + " RETURNING id"
+            cursor = self.execute(sql, parameters)
+            row = cursor.fetchone()
+            return row["id"]
+
+        cursor = self.execute(sql, parameters)
+        return cursor.lastrowid
+
     def executescript(self, sql):
         if self._is_postgres:
             raise NotImplementedError(

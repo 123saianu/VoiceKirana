@@ -8,11 +8,10 @@ def create_shop(name: str) -> int:
         raise ValueError("Shop name cannot be empty.")
 
     with get_connection() as connection:
-        cursor = connection.execute(
+        return connection.insert_returning_id(
             "INSERT INTO shops (name) VALUES (?)",
-            (name,)
+            (name,),
         )
-        return cursor.lastrowid
 
 
 def create_product(
@@ -29,15 +28,14 @@ def create_product(
         raise ValueError("Product name and base unit are required.")
 
     with get_connection() as connection:
-        cursor = connection.execute(
+        return connection.insert_returning_id(
             """
             INSERT INTO products
                 (name, normalized_name, brand, variant, base_unit)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (name, name.casefold(), brand, variant, base_unit)
+            (name, name.casefold(), brand, variant, base_unit),
         )
-        return cursor.lastrowid
 
 
 def set_inventory(
