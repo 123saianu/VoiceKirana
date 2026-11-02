@@ -1,11 +1,17 @@
 import os
 import sqlite3
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Keep the database inside the project's data folder.
+# Load .env before reading database configuration.
+load_dotenv()
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
 DATABASE_PATH = Path(
     os.getenv(
         "VOICEKIRANA_SQLITE_PATH",
@@ -14,14 +20,59 @@ DATABASE_PATH = Path(
 )
 
 
-def get_connection():
-    """Open a database connection and return rows by column name."""
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+class DatabaseConnection:
+    """Keep SQL calls compatible with SQLite and PostgreSQL."""
 
+    def __init__(self, connection, is_postgres: bool):
+        self._connection = connection
+        self._is_postgres = is_postgres
+
+    def execute(self, sql, parameters=()):
+        if self._is_postgres:
+            sql = sql.replace("?", "%s")
+
+        return self._connection.execute(sql, parameters)
+
+    def executescript(self, sql):
+        if self._is_postgres:
+            raise NotImplementedError(
+                "DatabaseConnection does not support executescript for PostgreSQL."
+            )
+        return self._connection.executescript(sql)
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def close(self):
+        self._connection.close()
+
+    @property
+    def row_factory(self):
+        return getattr(self._connection, "row_factory", None)
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._connection.row_factory = value
+
+
+def get_connection():
+    """Open a database connection using SQLite or PostgreSQL."""
+    if DATABASE_URL:
+        import psycopg
+
+        connection = psycopg.connect(DATABASE_URL)
+        connection.row_factory = None
+        return DatabaseConnection(connection, is_postgres=True)
+
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    return DatabaseConnection(connection, is_postgres=False)
 
 
 def initialize_database():
@@ -110,8 +161,31 @@ def initialize_database():
         ON orders(shop_id, status);
     """
 
+    if DATABASE_URL:
+        # PostgreSQL uses BIGSERIAL for generated primary keys.
+        schema = schema.replace(
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "BIGSERIAL PRIMARY KEY",
+        )
+
+        # Match PostgreSQL's BIGSERIAL primary-key types.
+        schema = schema.replace(
+            "shop_id INTEGER NOT NULL",
+            "shop_id BIGINT NOT NULL",
+        )
+        schema = schema.replace(
+            "product_id INTEGER NOT NULL",
+            "product_id BIGINT NOT NULL",
+        )
+        schema = schema.replace(
+            "order_id INTEGER NOT NULL",
+            "order_id BIGINT NOT NULL",
+        )
+
     with get_connection() as connection:
-        connection.executescript(schema)
+        for statement in schema.split(";"):
+            if statement.strip():
+                connection.execute(statement)
 
 
 if __name__ == "__main__":
