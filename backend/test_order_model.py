@@ -97,14 +97,17 @@ def test_order_clarification_after_item_update():
     )
 
     order = GroceryOrder(items=[item])
-
     assert order.needs_clarification is False
 
-    # Simulate the conversation discovering missing information.
+    # Clarification becomes necessary.
     item.needs_clarification = True
-
     assert order.refresh_clarification_status() is True
     assert order.needs_clarification is True
+
+    # The customer clarifies the item.
+    item.needs_clarification = False
+    assert order.refresh_clarification_status() is False
+    assert order.needs_clarification is False
 
 
 if __name__ == "__main__":
