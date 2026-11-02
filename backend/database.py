@@ -52,11 +52,24 @@ class DatabaseConnection:
         return self._connection.executescript(sql)
 
     def __enter__(self):
-        self._connection.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        return self._connection.__exit__(exc_type, exc_value, traceback)
+        if self._is_postgres:
+            if exc_type is None:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+
+            # Keep the connection open. It may be used again
+            # after this transaction block.
+            return False
+
+        return self._connection.__exit__(
+            exc_type,
+            exc_value,
+            traceback,
+        )
 
     def close(self):
         self._connection.close()
