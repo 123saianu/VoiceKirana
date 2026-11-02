@@ -3,6 +3,7 @@ uvicorn[standard]==0.30.6
 streamlit==1.39.0
 python-dotenv==1.0.1
 requests==2.34.2
+psycopg[binary]>=3.2,<4
 
 # Testing
 pytest

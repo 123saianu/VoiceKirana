@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Keep the database inside the project's data folder.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
