@@ -1,4 +1,6 @@
-from backend.database import get_connection, initialize_database
+import backend.database as database
+
+from backend.database import initialize_database
 from backend.services.inventory_service import (
     add_product_alias,
     create_product,
@@ -8,18 +10,27 @@ from backend.services.inventory_service import (
 )
 
 
-def test_inventory_service_smoke():
+def test_inventory_service_smoke(tmp_path, monkeypatch):
+    # Use a fresh, isolated database for this test.
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        database,
+        "DATABASE_PATH",
+        tmp_path / "voicekirana_test.db",
+    )
+
     initialize_database()
 
-    with get_connection() as connection:
-        connection.execute("DELETE FROM product_aliases")
-        connection.execute("DELETE FROM inventory")
-        connection.execute("DELETE FROM products")
-        connection.execute("DELETE FROM shops")
-
+    # The test database is empty, so no existing rows need deleting.
     shop_id = create_shop("Smoke Test Shop")
     product_id = create_product("Rice", "kg")
-    set_inventory(shop_id=shop_id, product_id=product_id, price_paise=6500, stock_quantity=20)
+
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=20,
+    )
     add_product_alias(product_id, "biyyam")
 
     direct_match = find_inventory(shop_id, "Rice")

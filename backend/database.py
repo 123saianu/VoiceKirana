@@ -1,15 +1,21 @@
+import os
 import sqlite3
 from pathlib import Path
 
 # Keep the database inside the project's data folder.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-DATABASE_PATH = DATA_DIR / "voicekirana.db"
+DATABASE_PATH = Path(
+    os.getenv(
+        "VOICEKIRANA_SQLITE_PATH",
+        str(DATA_DIR / "voicekirana.db"),
+    )
+)
 
 
 def get_connection():
     """Open a database connection and return rows by column name."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
