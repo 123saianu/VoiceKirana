@@ -74,10 +74,17 @@ def get_connection():
     """Open a database connection using SQLite or PostgreSQL."""
     if DATABASE_URL:
         import psycopg
+        from psycopg.rows import dict_row
 
-        connection = psycopg.connect(DATABASE_URL)
-        connection.row_factory = None
-        return DatabaseConnection(connection, is_postgres=True)
+        connection = psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+        )
+
+        return DatabaseConnection(
+            connection,
+            is_postgres=True,
+        )
 
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
