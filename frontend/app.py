@@ -18,11 +18,138 @@ st.set_page_config(
     layout="centered",
 )
 
+# ---------------------------------------------------------
+# VoiceKirana visual styling
+# ---------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    /* Main page */
+    .stApp {
+        background-color: #f7f9fc;
+    }
+
+    .block-container {
+        max-width: 900px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+
+    /* Headings */
+    h1 {
+        color: #14532d;
+        font-weight: 800;
+        letter-spacing: -0.8px;
+    }
+
+    h2, h3, h4 {
+        color: #1f2937;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        min-height: 42px;
+        border-radius: 10px;
+        font-weight: 600;
+        transition: border-color 0.2s ease;
+    }
+
+    .stButton > button[kind="primary"] {
+        background-color: #15803d;
+        border-color: #15803d;
+        color: white;
+    }
+
+    .stButton > button[kind="primary"]:hover {
+        background-color: #166534;
+        border-color: #166534;
+        color: white;
+    }
+
+    /* Form fields */
+    .stTextInput input,
+    .stNumberInput input,
+    .stSelectbox div[data-baseweb="select"] {
+        border-radius: 8px;
+    }
+
+    /* Status messages and expandable order cards */
+    div[data-testid="stAlert"] {
+        border-radius: 10px;
+    }
+
+    details[data-testid="stExpander"] {
+        border-radius: 10px;
+        border: 1px solid #e5e7eb;
+        background-color: white;
+    }
+
+    /* Readable body text and captions */
+    .stApp,
+    .stApp p,
+    .stApp label,
+    .stApp [data-testid="stCaptionContainer"] {
+        color: #263238;
+    }
+
+    /* Make information and status messages readable */
+    div[data-testid="stAlert"] p {
+        color: #263238 !important;
+    }
+
+    /* Reduce excessive vertical spacing */
+    .block-container {
+        gap: 0.75rem;
+    }
+
+    [data-testid="stVerticalBlock"] {
+        gap: 0.75rem;
+    }
+
+    /* Keep controls usable on smaller screens */
+    @media (max-width: 640px) {
+        .block-container {
+            padding-top: 1rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+
+        h1 {
+            font-size: 1.8rem;
+        }
+
+        .stButton > button {
+            min-height: 44px;
+        }
+    }
+
+    /* Make primary button text white and readable */
+    .stButton > button[kind="primary"],
+    .stButton > button[kind="primary"] p {
+        color: #ffffff !important;
+        font-weight: 700;
+    }
+
+    /* Make secondary button text readable */
+    .stButton > button:not([kind="primary"]),
+    .stButton > button:not([kind="primary"]) p {
+        color: #f9fafb !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🛒 VoiceKirana")
-st.write("Your multilingual grocery assistant.")
+st.subheader("Your multilingual grocery assistant")
+st.write(
+    "Build your grocery cart, check shop inventory, "
+    "review estimated prices, and hear the response."
+)
 st.caption(
-    "Build your grocery cart, validate the request, "
-    "check shop inventory, and hear the response."
+    "Order in English, Telugu, Hindi, or a mixture of languages. "
+    "Inventory checks do not reserve stock."
 )
 
 backend_url = os.getenv(
@@ -88,7 +215,7 @@ st.info(
 shop_id = st.number_input(
     "Shop ID",
     min_value=1,
-    value=203,
+    value=6,
     step=1,
     key="shop_id",
 )
