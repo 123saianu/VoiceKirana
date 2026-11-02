@@ -103,8 +103,7 @@ def test_order_clarification_after_item_update():
     # Simulate the conversation discovering missing information.
     item.needs_clarification = True
 
-    # This currently fails: changing a nested item doesn't rerun
-    # the parent order's model validator.
+    assert order.refresh_clarification_status() is True
     assert order.needs_clarification is True
 
 
