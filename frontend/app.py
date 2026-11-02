@@ -420,6 +420,8 @@ if submitted:
         st.info(preview.get("message", "Request validated."))
         st.write("**Validation status:**", preview.get("status"))
         st.json(preview.get("order", preview))
+        st.write("DEBUG — Submitted order payload")
+        st.json(order_payload)
 
         with st.spinner("Checking shop inventory..."):
             inventory_response = requests.post(

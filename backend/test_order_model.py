@@ -88,8 +88,29 @@ def test_complete_order_without_clarification():
     print("\nTest 2 PASSED: No clarification needed for complete order.")
 
 
+def test_order_clarification_after_item_update():
+    item = RequestedItem(
+        raw_name="jaggery",
+        quantity=1,
+        unit="packet",
+        needs_clarification=False,
+    )
+
+    order = GroceryOrder(items=[item])
+
+    assert order.needs_clarification is False
+
+    # Simulate the conversation discovering missing information.
+    item.needs_clarification = True
+
+    # This currently fails: changing a nested item doesn't rerun
+    # the parent order's model validator.
+    assert order.needs_clarification is True
+
+
 if __name__ == "__main__":
     test_general_grocery_order()
     test_complete_order_without_clarification()
+    test_order_clarification_after_item_update()
 
     print("\n===== ALL ORDER MODEL TESTS PASSED =====")
