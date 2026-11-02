@@ -304,6 +304,344 @@ def check_inventory(
     }
 
 
+from contextlib import closing
+
+
+@app.post("/orders/confirm")
+def confirm_order(
+    order: GroceryOrder,
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Save an order only after a fresh successful inventory check.
+
+    Saving the order does not reserve stock or guarantee shop acceptance.
+    """
+    authenticate_api_key(api_key)
+
+    if order.intent != "place_order":
+        raise HTTPException(
+            status_code=400,
+            detail="Only new grocery orders can be confirmed here.",
+        )
+
+    inventory_result = check_inventory(
+        order=order,
+        shop_id=shop_id,
+        api_key=api_key,
+    )
+
+    if inventory_result["status"] != "inventory_checked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "The order was not saved because some items "
+                    "need attention or inventory could not be confirmed."
+                ),
+                "inventory_result": inventory_result,
+            },
+        )
+
+    order_reference = f"VK-{secrets.token_hex(6).upper()}"
+    total_paise = inventory_result["total_paise"]
+    checked_items = inventory_result["items"]
+
+    with closing(get_connection()) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO orders (
+                    order_reference,
+                    shop_id,
+                    status,
+                    total_amount
+                )
+                VALUES (?, ?, 'pending', ?)
+                """,
+                (order_reference, shop_id, total_paise),
+            )
+
+            order_id = cursor.lastrowid
+
+            for item in checked_items:
+                connection.execute(
+                    """
+                    INSERT INTO order_items (
+                        order_id,
+                        product_id,
+                        quantity,
+                        unit,
+                        unit_price,
+                        line_total
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        item["product_id"],
+                        item["quantity"],
+                        item["unit"],
+                        item["unit_price_paise"],
+                        item["line_total_paise"],
+                    ),
+                )
+
+    return {
+        "status": "pending",
+        "message": (
+            "The order request has been saved. "
+            "Shop acceptance is not yet confirmed, and stock "
+            "has not been reserved."
+        ),
+        "order_id": order_id,
+        "order_reference": order_reference,
+        "shop_id": shop_id,
+        "shop_name": inventory_result["shop_name"],
+        "total_paise": total_paise,
+        "total_rupees": round(total_paise / 100, 2),
+        "items": checked_items,
+        "stock_reserved": False,
+    }
+
+
+@app.get("/orders/history")
+def order_history(
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """Return saved orders and their items for one shop."""
+    authenticate_api_key(api_key)
+
+    with closing(get_connection()) as connection:
+        shop = connection.execute(
+            "SELECT id, name FROM shops WHERE id = ? AND is_active = 1",
+            (shop_id,),
+        ).fetchone()
+
+        if shop is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Active shop not found.",
+            )
+
+        order_rows = connection.execute(
+            """
+            SELECT
+                id,
+                order_reference,
+                status,
+                total_amount,
+                created_at
+            FROM orders
+            WHERE shop_id = ?
+            ORDER BY id DESC
+            """,
+            (shop_id,),
+        ).fetchall()
+
+        history = []
+
+        for saved_order in order_rows:
+            item_rows = connection.execute(
+                """
+                SELECT
+                    p.name AS product_name,
+                    p.brand,
+                    p.variant,
+                    oi.quantity,
+                    oi.unit,
+                    oi.unit_price,
+                    oi.line_total
+                FROM order_items AS oi
+                JOIN products AS p ON p.id = oi.product_id
+                WHERE oi.order_id = ?
+                ORDER BY oi.id
+                """,
+                (saved_order["id"],),
+            ).fetchall()
+
+            history.append({
+                "order_id": saved_order["id"],
+                "order_reference": saved_order["order_reference"],
+                "status": saved_order["status"],
+                "total_paise": saved_order["total_amount"],
+                "total_rupees": round(
+                    saved_order["total_amount"] / 100, 2
+                ),
+                "created_at": saved_order["created_at"],
+                "items": [
+                    {
+                        "product_name": item["product_name"],
+                        "brand": item["brand"],
+                        "variant": item["variant"],
+                        "quantity": item["quantity"],
+                        "unit": item["unit"],
+                        "unit_price_paise": item["unit_price"],
+                        "line_total_paise": item["line_total"],
+                    }
+                    for item in item_rows
+                ],
+            })
+
+    return {
+        "shop_id": shop_id,
+        "shop_name": shop["name"],
+        "count": len(history),
+        "orders": history,
+    }
+
+
+def _load_order_details(connection, order_row):
+    """Build a complete order response, including its saved item rows."""
+    item_rows = connection.execute(
+        """
+        SELECT
+            p.name AS product_name,
+            p.brand,
+            p.variant,
+            oi.quantity,
+            oi.unit,
+            oi.unit_price,
+            oi.line_total
+        FROM order_items AS oi
+        JOIN products AS p ON p.id = oi.product_id
+        WHERE oi.order_id = ?
+        ORDER BY oi.id
+        """,
+        (order_row["id"],),
+    ).fetchall()
+
+    total_paise = order_row["total_amount"]
+    return {
+        "order_id": order_row["id"],
+        "order_reference": order_row["order_reference"],
+        "shop_id": order_row["shop_id"],
+        "status": order_row["status"],
+        "total_paise": total_paise,
+        "total_rupees": round(total_paise / 100, 2),
+        "created_at": order_row["created_at"],
+        "items": [
+            {
+                "product_name": item["product_name"],
+                "brand": item["brand"],
+                "variant": item["variant"],
+                "quantity": item["quantity"],
+                "unit": item["unit"],
+                "unit_price_paise": item["unit_price"],
+                "unit_price_rupees": round(item["unit_price"] / 100, 2),
+                "line_total_paise": item["line_total"],
+                "line_total_rupees": round(item["line_total"] / 100, 2),
+            }
+            for item in item_rows
+        ],
+    }
+
+
+@app.get("/orders/{order_reference}")
+def get_order(
+    order_reference: str,
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """Retrieve one saved order by reference, scoped to its shop."""
+    authenticate_api_key(api_key)
+
+    with closing(get_connection()) as connection:
+        shop = connection.execute(
+            "SELECT id FROM shops WHERE id = ? AND is_active = 1",
+            (shop_id,),
+        ).fetchone()
+        if shop is None:
+            raise HTTPException(status_code=404, detail="Active shop not found.")
+
+        order_row = connection.execute(
+            """
+            SELECT id, order_reference, shop_id, status, total_amount, created_at
+            FROM orders
+            WHERE order_reference = ? AND shop_id = ?
+            """,
+            (order_reference, shop_id),
+        ).fetchone()
+
+        if order_row is None:
+            raise HTTPException(status_code=404, detail="Order not found.")
+
+        return _load_order_details(connection, order_row)
+
+
+@app.post("/orders/{order_reference}/cancel")
+def cancel_order(
+    order_reference: str,
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """Cancel a pending order and persist the status change."""
+    authenticate_api_key(api_key)
+
+    with closing(get_connection()) as connection:
+        shop = connection.execute(
+            "SELECT id FROM shops WHERE id = ? AND is_active = 1",
+            (shop_id,),
+        ).fetchone()
+        if shop is None:
+            raise HTTPException(status_code=404, detail="Active shop not found.")
+
+        with connection:
+            order_row = connection.execute(
+                """
+                SELECT id, order_reference, shop_id, status, total_amount, created_at
+                FROM orders
+                WHERE order_reference = ? AND shop_id = ?
+                """,
+                (order_reference, shop_id),
+            ).fetchone()
+
+            if order_row is None:
+                raise HTTPException(status_code=404, detail="Order not found.")
+
+            if order_row["status"] != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Only pending orders can be cancelled. "
+                        f"Current status: {order_row['status']}."
+                    ),
+                )
+
+            cursor = connection.execute(
+                """
+                UPDATE orders
+                SET status = 'cancelled'
+                WHERE id = ? AND status = 'pending'
+                """,
+                (order_row["id"],),
+            )
+            if cursor.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The order status changed before cancellation completed.",
+                )
+
+        updated_order = connection.execute(
+            """
+            SELECT id, order_reference, shop_id, status, total_amount, created_at
+            FROM orders
+            WHERE id = ?
+            """,
+            (order_row["id"],),
+        ).fetchone()
+
+        result = _load_order_details(connection, updated_order)
+
+    result["message"] = (
+        "The pending order was cancelled. No stock reservation was made by "
+        "VoiceKirana, so no stock was returned to inventory."
+    )
+    return result
+
+
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 

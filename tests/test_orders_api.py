@@ -3,6 +3,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import backend.main as main
+from backend.database import get_connection, initialize_database
+from backend.services.inventory_service import (
+    create_shop,
+    create_product,
+    set_inventory,
+)
 
 
 TEST_API_TOKEN = "voicekirana-test-token"
@@ -172,14 +178,6 @@ def test_invalid_api_key_is_rejected(client):
     assert response.status_code == 401
 
 
-from backend.database import initialize_database
-from backend.services.inventory_service import (
-    create_shop,
-    create_product,
-    set_inventory,
-)
-
-
 def test_inventory_check_success(client):
     initialize_database()
     shop_id = create_shop("Inventory API Test Shop")
@@ -296,4 +294,226 @@ def test_inventory_check_requires_authentication(client):
         },
     )
 
+    assert response.status_code == 401
+
+
+def test_confirm_order_saves_order_and_items(client):
+    initialize_database()
+
+    shop_id = create_shop("Order Confirmation Test Shop")
+    product_id = create_product(
+        name="Rice",
+        base_unit="kg",
+    )
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=20,
+    )
+
+    response = client.post(
+        f"/orders/confirm?shop_id={shop_id}",
+        json={
+            "intent": "place_order",
+            "items": [
+                {
+                    "raw_name": "rice",
+                    "normalized_name": "rice",
+                    "quantity": 2,
+                    "unit": "kg",
+                }
+            ],
+        },
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["status"] == "pending"
+    assert data["order_reference"].startswith("VK-")
+    assert data["total_paise"] == 13000
+    assert data["stock_reserved"] is False
+    assert len(data["items"]) == 1
+
+    history_response = client.get(
+        f"/orders/history?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert history_response.status_code == 200
+
+    history = history_response.json()
+    assert history["count"] == 1
+    assert history["orders"][0]["order_reference"] == data["order_reference"]
+    assert history["orders"][0]["total_paise"] == 13000
+    assert history["orders"][0]["items"][0]["product_name"] == "Rice"
+
+
+def test_confirm_order_rejects_unmatched_product(client):
+    initialize_database()
+
+    shop_id = create_shop("Invalid Order Test Shop")
+
+    with get_connection() as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) AS total FROM orders"
+        ).fetchone()["total"]
+
+    response = client.post(
+        f"/orders/confirm?shop_id={shop_id}",
+        json={
+            "intent": "place_order",
+            "items": [
+                {
+                    "raw_name": "unlisted mystery product",
+                    "quantity": 1,
+                    "unit": "piece",
+                }
+            ],
+        },
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["inventory_result"]["status"] == (
+        "needs_attention"
+    )
+
+    with get_connection() as connection:
+        after = connection.execute(
+            "SELECT COUNT(*) AS total FROM orders"
+        ).fetchone()["total"]
+
+    assert after == before
+
+
+def test_order_history_requires_authentication(client):
+    response = client.get("/orders/history?shop_id=1")
+
+    assert response.status_code == 401
+
+
+def _create_pending_rice_order(client, shop_name="Day 8 Order Test Shop"):
+    """Create an isolated active shop and one pending rice order."""
+    initialize_database()
+    shop_id = create_shop(shop_name)
+    product_id = create_product(name="Rice", base_unit="kg")
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=20,
+    )
+
+    response = client.post(
+        f"/orders/confirm?shop_id={shop_id}",
+        json={
+            "intent": "place_order",
+            "items": [
+                {
+                    "raw_name": "rice",
+                    "normalized_name": "rice",
+                    "quantity": 2,
+                    "unit": "kg",
+                }
+            ],
+        },
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+    assert response.status_code == 200
+    return shop_id, response.json()
+
+
+def test_get_order_by_reference_returns_saved_order(client):
+    shop_id, saved = _create_pending_rice_order(client, "Day 8 Lookup Shop")
+
+    response = client.get(
+        f"/orders/{saved['order_reference']}?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["order_reference"] == saved["order_reference"]
+    assert data["status"] == "pending"
+    assert data["total_paise"] == 13000
+    assert data["items"][0]["product_name"] == "Rice"
+    assert data["items"][0]["quantity"] == 2
+
+
+def test_get_order_by_unknown_reference_returns_404(client):
+    initialize_database()
+    shop_id = create_shop("Day 8 Unknown Order Shop")
+
+    response = client.get(
+        f"/orders/VK-DOESNOTEXIST?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Order not found."
+
+
+def test_order_lookup_is_scoped_to_shop(client):
+    shop_id, saved = _create_pending_rice_order(client, "Day 8 Private Shop")
+    other_shop_id = create_shop("Day 8 Other Shop")
+
+    response = client.get(
+        f"/orders/{saved['order_reference']}?shop_id={other_shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 404
+
+
+def test_cancel_pending_order_persists_cancelled_status(client):
+    shop_id, saved = _create_pending_rice_order(client, "Day 8 Cancellation Shop")
+
+    response = client.post(
+        f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+    lookup = client.get(
+        f"/orders/{saved['order_reference']}?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["status"] == "cancelled"
+
+    history = client.get(
+        f"/orders/history?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+    assert history.status_code == 200
+    assert history.json()["orders"][0]["status"] == "cancelled"
+
+
+def test_cancelled_order_cannot_be_cancelled_again(client):
+    shop_id, saved = _create_pending_rice_order(client, "Day 8 Repeat Cancel Shop")
+    url = f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}"
+    headers = {"X-API-Key": TEST_API_TOKEN}
+
+    first = client.post(url, headers=headers)
+    second = client.post(url, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "Only pending orders" in second.json()["detail"]
+
+
+def test_order_lookup_requires_authentication(client):
+    response = client.get("/orders/VK-ANYREFERENCE?shop_id=1")
+    assert response.status_code == 401
+
+
+def test_order_cancellation_requires_authentication(client):
+    response = client.post(
+        "/orders/VK-ANYREFERENCE/cancel?shop_id=1"
+    )
     assert response.status_code == 401
