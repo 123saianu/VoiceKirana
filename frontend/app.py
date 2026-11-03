@@ -418,8 +418,61 @@ if submitted:
 
         st.subheader("Order validation")
         st.info(preview.get("message", "Request validated."))
-        st.write("**Validation status:**", preview.get("status"))
-        st.json(preview.get("order", preview))
+
+        validation_status = preview.get("status", "unknown")
+        st.write(
+            "**Validation status:**",
+            validation_status.replace("_", " ").title()
+            if isinstance(validation_status, str)
+            else validation_status,
+        )
+
+        validated_order = preview.get("order", preview)
+
+        if isinstance(validated_order, dict):
+            items = validated_order.get("items", [])
+
+            if items:
+                st.markdown("#### Your requested items")
+
+                summary_rows = []
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    product_name = (
+                        item.get("raw_name")
+                        or item.get("normalized_name")
+                        or item.get("name")
+                        or "Unknown item"
+                    )
+
+                    quantity = item.get("quantity", "—")
+                    unit = item.get("unit", "")
+                    brand = item.get("brand")
+
+                    summary_rows.append(
+                        {
+                            "Product": product_name,
+                            "Quantity": f"{quantity} {unit}".strip(),
+                            "Brand": brand or "Not specified",
+                        }
+                    )
+
+                if summary_rows:
+                    st.dataframe(
+                        summary_rows,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            else:
+                st.caption(
+                    "The request was validated, but no item summary "
+                    "was returned."
+                )
+        else:
+            st.caption("The backend returned an unexpected order format.")
 
         with st.spinner("Checking shop inventory..."):
             inventory_response = requests.post(
@@ -464,8 +517,10 @@ if submitted:
         st.divider()
         st.subheader("📦 Inventory results")
 
-        if result.get("status") == "inventory_checked":
-            st.success(message)
+        inventory_status = result.get("status", "unknown")
+
+        if inventory_status == "inventory_checked":
+            st.success("All requested items are available in the required quantities.")
             st.write("**Shop:**", result.get("shop_name", "Unknown"))
 
             total = result.get("total_rupees")
@@ -473,57 +528,82 @@ if submitted:
                 st.metric("Estimated total", f"₹{total:.2f}")
 
             st.caption(
-                "This is an inventory estimate, not a confirmed purchase."
+                "This is an estimate only. Your order is not saved "
+                "until you explicitly confirm it."
             )
         else:
-            st.warning(message)
+            st.warning(
+                message
+                or "We couldn't match every item to the shop's inventory. "
+                   "Review the items below."
+            )
+
+        status_messages = {
+            "matched": "Available — matched with shop inventory.",
+            "insufficient_stock": (
+                "Not enough stock. Reduce the quantity or contact the shop."
+            ),
+            "unavailable": (
+                "This product is unavailable at this shop. "
+                "Ask the shop about alternatives."
+            ),
+            "not_found": (
+                "We couldn't find this product. Check the name or ask "
+                "the shop to add it to its inventory."
+            ),
+            "ambiguous": (
+                "More than one product may match. Select the correct "
+                "product before continuing."
+            ),
+        }
 
         for item_result in result.get("items", []):
-            item_name = item_result.get(
-                "requested_name",
-                "Unknown item",
-            )
+            item_name = item_result.get("requested_name", "Unknown item")
             item_status = item_result.get("status", "unknown")
+            display_status = item_status.replace("_", " ").title()
 
             with st.expander(
-                f"{item_name} — "
-                f"{item_status.replace('_', ' ').title()}",
-                expanded=True,
+                f"{item_name} — {display_status}",
+                expanded=item_status != "matched",
             ):
-                st.write(item_result.get("message", ""))
+                st.write(
+                    status_messages.get(
+                        item_status,
+                        item_result.get(
+                            "message",
+                            "Please review this item with the shop.",
+                        ),
+                    )
+                )
 
                 if item_status == "matched":
                     st.write(
-                        f"Quantity: {item_result['quantity']} "
+                        f"**Quantity:** {item_result['quantity']} "
                         f"{item_result['unit']}"
                     )
                     st.write(
-                        f"Unit price: "
+                        f"**Unit price:** "
                         f"₹{item_result['unit_price_rupees']:.2f}"
                     )
                     st.write(
-                        f"Line total: "
+                        f"**Line total:** "
                         f"₹{item_result['line_total_rupees']:.2f}"
                     )
                     st.write(
-                        f"Available stock: "
+                        f"**Available stock:** "
                         f"{item_result['available_quantity']} "
                         f"{item_result['unit']}"
                     )
 
                 elif item_status == "insufficient_stock":
                     st.write(
-                        "Requested quantity:",
-                        item_result.get("requested_quantity"),
+                        "**Requested quantity:**",
+                        item_result.get("requested_quantity", "Unknown"),
                     )
                     st.write(
-                        "Available quantity:",
-                        item_result.get("available_quantity"),
+                        "**Available quantity:**",
+                        item_result.get("available_quantity", "Unknown"),
                     )
-
-                elif "candidates" in item_result:
-                    st.write("Matching catalogue products:")
-                    st.json(item_result["candidates"])
 
         st.caption(
             "No stock has been reserved and no order has been placed."
@@ -665,19 +745,40 @@ if history and history.get("shop_id") == int(shop_id):
     else:
         st.caption(f"{history['count']} saved order(s) for {history['shop_name']}")
         for saved_order in history["orders"]:
+            status = str(saved_order.get("status", "unknown")).lower()
+
+            status_display = {
+                "pending": ("🟡", "Pending — awaiting shop acceptance"),
+                "confirmed": ("🟢", "Confirmed"),
+                "accepted": ("🟢", "Accepted by shop"),
+                "completed": ("✅", "Completed"),
+                "cancelled": ("⚪", "Cancelled"),
+                "rejected": ("🔴", "Rejected"),
+            }
+
+            status_icon, status_message = status_display.get(
+                status,
+                ("ℹ️", status.replace("_", " ").title()),
+            )
+
             with st.expander(
                 f"{saved_order['order_reference']} — "
-                f"{saved_order['status'].title()} — "
+                f"{status_icon} {status.replace('_', ' ').title()} — "
                 f"₹{saved_order['total_rupees']:.2f}"
             ):
+                st.markdown(f"**Order status:** {status_icon} {status_message}")
                 st.write("**Created:**", saved_order["created_at"])
                 st.write("**Total:**", f"₹{saved_order['total_rupees']:.2f}")
+
                 for saved_item in saved_order["items"]:
                     product_label = saved_item["product_name"]
+
                     if saved_item.get("brand"):
                         product_label += f" ({saved_item['brand']})"
+
                     if saved_item.get("variant"):
                         product_label += f" — {saved_item['variant']}"
+
                     st.write(
                         f"- {product_label}: {saved_item['quantity']} "
                         f"{saved_item['unit']} × "
