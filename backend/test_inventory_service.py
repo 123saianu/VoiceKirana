@@ -14,6 +14,7 @@ from backend.services.inventory_service import (
 
 def test_inventory_service_smoke(tmp_path, monkeypatch):
     # Use a fresh, isolated database for this test.
+    monkeypatch.setattr(database, "DATABASE_URL", "")
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(
         database,
@@ -60,6 +61,7 @@ def test_inventory_returns_multiple_matches_for_shared_alias(
     tmp_path, monkeypatch
 ):
     # Use a fresh, isolated database.
+    monkeypatch.setattr(database, "DATABASE_URL", "")
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(
         database,
@@ -92,6 +94,7 @@ def test_inventory_returns_multiple_matches_for_shared_alias(
 
 def test_inventory_api_reports_ambiguous_match(tmp_path, monkeypatch):
     # Isolate the database for this API test.
+    monkeypatch.setattr(database, "DATABASE_URL", "")
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(
         database,

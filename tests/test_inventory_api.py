@@ -11,19 +11,25 @@ from backend.services.inventory_service import (
     set_inventory,
 )
 
-
 TEST_API_TOKEN = "voicekirana-test-token"
 
 
-@pytest.fixture
-def client(monkeypatch, tmp_path):
+@pytest.fixture(autouse=True)
+def isolate_inventory_api_database(monkeypatch, tmp_path):
+    """Use a fresh SQLite database for every test in this module."""
     test_db_path = tmp_path / "voicekirana_test.db"
 
+    monkeypatch.setattr(database, "DATABASE_URL", "")
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "DATABASE_PATH", test_db_path)
     monkeypatch.setattr(main, "VOICEKIRANA_API_TOKEN", TEST_API_TOKEN)
 
-    database.initialize_database()
+    initialize_database()
 
+
+@pytest.fixture
+def client():
+    """Create a test client using the isolated test database."""
     return TestClient(main.app)
 
 
@@ -31,12 +37,14 @@ def client(monkeypatch, tmp_path):
 def stocked_shop():
     shop_id = create_shop("Inventory API Test Shop")
     rice_id = create_product("Rice", "kg")
+
     set_inventory(
         shop_id=shop_id,
         product_id=rice_id,
         price_paise=6500,
         stock_quantity=20,
     )
+
     return shop_id
 
 

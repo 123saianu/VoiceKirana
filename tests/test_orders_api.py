@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import backend.main as main
+import backend.database as database
 from backend.database import get_connection, initialize_database
 from backend.services.inventory_service import (
     create_shop,
@@ -10,19 +11,25 @@ from backend.services.inventory_service import (
     set_inventory,
 )
 
-
 TEST_API_TOKEN = "voicekirana-test-token"
 
 
-@pytest.fixture
-def client(monkeypatch):
-    # Use a test-only token instead of the real secret.
-    monkeypatch.setattr(
-        main,
-        "VOICEKIRANA_API_TOKEN",
-        TEST_API_TOKEN
-    )
+@pytest.fixture(autouse=True)
+def isolate_orders_api_database(monkeypatch, tmp_path):
+    """Use a fresh SQLite database for every order API test."""
+    test_db_path = tmp_path / "voicekirana_orders_test.db"
 
+    monkeypatch.setattr(database, "DATABASE_URL", "")
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(database, "DATABASE_PATH", test_db_path)
+    monkeypatch.setattr(main, "VOICEKIRANA_API_TOKEN", TEST_API_TOKEN)
+
+    initialize_database()
+
+
+@pytest.fixture
+def client():
+    """Create a test client using the isolated database."""
     return TestClient(main.app)
 
 
@@ -517,3 +524,89 @@ def test_order_cancellation_requires_authentication(client):
         "/orders/VK-ANYREFERENCE/cancel?shop_id=1"
     )
     assert response.status_code == 401
+
+
+def _deactivate_shop(shop_id):
+    """Mark a shop inactive for API edge-case tests."""
+    with get_connection() as connection:
+        with connection:
+            connection.execute(
+                "UPDATE shops SET is_active = 0 WHERE id = ?",
+                (shop_id,),
+            )
+
+
+def test_get_order_rejects_inactive_shop(client):
+    shop_id, saved = _create_pending_rice_order(
+        client, "Day 10 Inactive Lookup Shop"
+    )
+    _deactivate_shop(shop_id)
+
+    response = client.get(
+        f"/orders/{saved['order_reference']}?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Active shop not found."
+
+
+def test_cancel_order_rejects_inactive_shop(client):
+    shop_id, saved = _create_pending_rice_order(
+        client, "Day 10 Inactive Cancellation Shop"
+    )
+    _deactivate_shop(shop_id)
+
+    response = client.post(
+        f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Active shop not found."
+
+
+def test_cancelling_unknown_order_returns_404(client):
+    initialize_database()
+    shop_id = create_shop("Day 10 Missing Cancellation Shop")
+
+    response = client.post(
+        f"/orders/VK-DOESNOTEXIST/cancel?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Order not found."
+
+
+def test_cancellation_preserves_order_total_and_items(client):
+    shop_id, saved = _create_pending_rice_order(
+        client, "Day 10 Order Integrity Shop"
+    )
+    reference = saved["order_reference"]
+    headers = {"X-API-Key": TEST_API_TOKEN}
+
+    before = client.get(
+        f"/orders/{reference}?shop_id={shop_id}",
+        headers=headers,
+    )
+    assert before.status_code == 200
+
+    before_data = before.json()
+
+    cancelled = client.post(
+        f"/orders/{reference}/cancel?shop_id={shop_id}",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200
+
+    after = client.get(
+        f"/orders/{reference}?shop_id={shop_id}",
+        headers=headers,
+    )
+    assert after.status_code == 200
+
+    after_data = after.json()
+    assert after_data["status"] == "cancelled"
+    assert after_data["total_paise"] == before_data["total_paise"]
+    assert after_data["items"] == before_data["items"]

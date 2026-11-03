@@ -1,3 +1,7 @@
+
+import pytest
+
+from backend import database
 from backend.database import get_connection
 from backend.services.inventory_service import (
     add_product_alias,
@@ -6,6 +10,12 @@ from backend.services.inventory_service import (
     find_inventory,
     set_inventory,
 )
+
+
+@pytest.fixture(autouse=True)
+def use_sqlite_for_inventory_alias_tests(monkeypatch):
+    """Prevent inventory alias tests from hanging on PostgreSQL connections."""
+    monkeypatch.setattr(database, "DATABASE_URL", "")
 
 
 def test_biyyam_alias_resolves_to_rice():
@@ -86,15 +96,6 @@ def test_shared_alias_returns_both_products():
                 )
 
 
-import pytest
-
-from backend.services.inventory_service import (
-    create_shop,
-    create_product,
-    set_inventory,
-)
-
-
 def test_find_inventory_returns_empty_for_blank_name():
     assert find_inventory(1, "   ") == []
 
@@ -105,10 +106,14 @@ def test_create_shop_rejects_blank_name():
 
 
 def test_create_product_rejects_blank_name_or_unit():
-    with pytest.raises(ValueError, match="Product name and base unit are required"):
+    with pytest.raises(
+        ValueError, match="Product name and base unit are required"
+    ):
         create_product("   ", "kg")
 
-    with pytest.raises(ValueError, match="Product name and base unit are required"):
+    with pytest.raises(
+        ValueError, match="Product name and base unit are required"
+    ):
         create_product("Rice", "   ")
 
 
@@ -125,13 +130,16 @@ def test_set_inventory_rejects_negative_price_and_stock():
     finally:
         with get_connection() as connection:
             connection.execute(
-                "DELETE FROM inventory WHERE product_id = ?", (product_id,)
+                "DELETE FROM inventory WHERE product_id = ?",
+                (product_id,),
             )
             connection.execute(
-                "DELETE FROM products WHERE id = ?", (product_id,)
+                "DELETE FROM products WHERE id = ?",
+                (product_id,),
             )
             connection.execute(
-                "DELETE FROM shops WHERE id = ?", (shop_id,)
+                "DELETE FROM shops WHERE id = ?",
+                (shop_id,),
             )
 
 
@@ -148,15 +156,9 @@ def test_add_product_alias_rejects_blank_alias():
                 (product_id,),
             )
             connection.execute(
-                "DELETE FROM products WHERE id = ?", (product_id,)
+                "DELETE FROM products WHERE id = ?",
+                (product_id,),
             )
-
-
-import pytest
-
-from backend.services.inventory_service import (
-    set_inventory,
-)
 
 
 def test_set_inventory_rejects_nonexistent_shop():
@@ -173,7 +175,8 @@ def test_set_inventory_rejects_nonexistent_shop():
     finally:
         with get_connection() as connection:
             connection.execute(
-                "DELETE FROM products WHERE id = ?", (product_id,)
+                "DELETE FROM products WHERE id = ?",
+                (product_id,),
             )
 
 
@@ -191,7 +194,8 @@ def test_set_inventory_rejects_nonexistent_product():
     finally:
         with get_connection() as connection:
             connection.execute(
-                "DELETE FROM shops WHERE id = ?", (shop_id,)
+                "DELETE FROM shops WHERE id = ?",
+                (shop_id,),
             )
 
 
@@ -204,7 +208,10 @@ def test_canonical_product_name_is_not_added_as_alias():
     product_id = create_product("Canonical Alias Test Product", "kg")
 
     try:
-        add_product_alias(product_id, "  CANONICAL ALIAS TEST PRODUCT  ")
+        add_product_alias(
+            product_id,
+            "  CANONICAL ALIAS TEST PRODUCT  ",
+        )
 
         with get_connection() as connection:
             row = connection.execute(
@@ -224,5 +231,6 @@ def test_canonical_product_name_is_not_added_as_alias():
                 (product_id,),
             )
             connection.execute(
-                "DELETE FROM products WHERE id = ?", (product_id,)
+                "DELETE FROM products WHERE id = ?",
+                (product_id,),
             )
