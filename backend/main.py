@@ -1,9 +1,10 @@
 
+import json
 import os
 import secrets
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 
 from backend.database import get_connection
 from backend.models.order import GroceryOrder
@@ -48,15 +49,47 @@ def health_check():
 
 
 @app.post("/orders/preview")
-def preview_order(
-    order: GroceryOrder,
+async def preview_order(
+    request: Request,
     api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
-    """
-    Validate an order.
-    This endpoint does not check inventory or place an order.
-    """
+    """Validate direct orders or JSON-string orders received from Gnani."""
     authenticate_api_key(api_key)
+
+    try:
+        payload = await request.json()
+
+        if "order_request" in payload:
+            order_payload = payload["order_request"]
+
+            # Gnani may send the order as a JSON string.
+            if isinstance(order_payload, str):
+                order_payload = json.loads(order_payload)
+
+            if not isinstance(order_payload, dict):
+                raise ValueError("order_request must be a JSON object.")
+
+            order_payload.setdefault(
+                "intent",
+                payload.get("customer_intent", payload.get("intent", "unknown")),
+            )
+            order_payload.setdefault("language", payload.get("language"))
+
+            if payload.get("additional_instructions") is not None:
+                order_payload.setdefault(
+                    "additional_instructions",
+                    payload["additional_instructions"],
+                )
+        else:
+            order_payload = payload
+
+        order = GroceryOrder.model_validate(order_payload)
+
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid order request: {exc}",
+        ) from exc
 
     order_data = order.model_dump()
 

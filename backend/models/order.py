@@ -83,8 +83,7 @@ class GroceryOrder(BaseModel):
         """
         Recalculate the order flag from the current item states.
         """
-        self.needs_clarification = (
-            self.needs_clarification
-            or any(item.needs_clarification for item in self.items)
+        self.needs_clarification = any(
+            item.needs_clarification for item in self.items
         )
         return self.needs_clarification
