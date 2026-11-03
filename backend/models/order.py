@@ -80,9 +80,7 @@ class GroceryOrder(BaseModel):
         return self
 
     def refresh_clarification_status(self) -> bool:
-        """
-        Recalculate the order flag from the current item states.
-        """
+        """Recalculate clarification status from current item states."""
         self.needs_clarification = any(
             item.needs_clarification for item in self.items
         )
