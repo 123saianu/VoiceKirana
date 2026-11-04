@@ -35,3 +35,15 @@ data/*.db
 data/*.db-*
 
 cloudflared-diag-*.zip
+# Additional database formats and backups
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+
+# Generated audio recordings (only if not intended as project assets)
+data/*.wav
+data/*.m4a
+
+# Cloudflared rotated logs
+*.log.*
