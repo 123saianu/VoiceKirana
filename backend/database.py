@@ -85,6 +85,10 @@ class DatabaseConnection:
 
 def get_connection():
     """Open a database connection using SQLite or PostgreSQL."""
+    print(
+        "VOICEKIRANA DATABASE MODE:",
+        "PostgreSQL" if DATABASE_URL else "SQLite",
+    )
     if DATABASE_URL:
         import psycopg
         from psycopg.rows import dict_row
@@ -100,6 +104,7 @@ def get_connection():
         )
 
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print("ACTIVE SQLITE DATABASE:", DATABASE_PATH.resolve())
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -117,6 +122,40 @@ def initialize_database():
             CHECK (is_active IN (0, 1)),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        full_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1
+            CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS shop_memberships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        shop_id INTEGER NOT NULL,
+        role TEXT NOT NULL DEFAULT 'owner'
+            CHECK (role IN ('owner', 'manager')),
+        is_active INTEGER NOT NULL DEFAULT 1
+            CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE,
+        FOREIGN KEY (shop_id)
+            REFERENCES shops(id)
+            ON DELETE CASCADE,
+        UNIQUE (user_id, shop_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_shop_memberships_user
+        ON shop_memberships(user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_shop_memberships_shop
+        ON shop_memberships(shop_id);
 
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,6 +250,10 @@ def initialize_database():
         schema = schema.replace(
             "order_id INTEGER NOT NULL",
             "order_id BIGINT NOT NULL",
+        )
+        schema = schema.replace(
+            "user_id INTEGER NOT NULL",
+            "user_id BIGINT NOT NULL",
         )
 
     with get_connection() as connection:

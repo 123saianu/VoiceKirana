@@ -115,19 +115,14 @@ async def preview_order(
     }
 
 
-@app.post("/inventory/check")
-def check_inventory(
-    order: GroceryOrder,
-    shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
-):
+def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
     """
-    Check requested products against one shop's catalogue.
+    Shared inventory-checking logic.
 
-    This endpoint does not reserve stock, create an order,
-    or place a purchase.
+    Can be called directly by confirm_order() or through the
+    /inventory/check HTTP endpoint.
+    Does not reserve stock or place an order.
     """
-    authenticate_api_key(api_key)
 
     if order.needs_clarification:
         return {
@@ -337,6 +332,69 @@ def check_inventory(
     }
 
 
+@app.post("/inventory/check")
+async def check_inventory(
+    request: Request,
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Check requested products against one shop's catalogue.
+
+    Accepts either a direct GroceryOrder or a JSON-string order_request.
+    Does not reserve stock or place an order.
+    """
+    authenticate_api_key(api_key)
+
+    try:
+        payload = await request.json()
+
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object.")
+
+        if "order_request" in payload:
+            order_payload = payload["order_request"]
+
+            # Decode the complete order sent as a JSON string by Gnani.
+            if isinstance(order_payload, str):
+                order_payload = json.loads(order_payload)
+
+            if not isinstance(order_payload, dict):
+                raise ValueError("order_request must be a JSON object.")
+
+            order_payload.setdefault(
+                "intent",
+                payload.get(
+                    "customer_intent",
+                    payload.get("intent", "place_order"),
+                ),
+            )
+            order_payload.setdefault("language", payload.get("language"))
+
+            if payload.get("additional_instructions") is not None:
+                order_payload.setdefault(
+                    "additional_instructions",
+                    payload["additional_instructions"],
+                )
+        else:
+            # Preserve support for direct GroceryOrder requests.
+            order_payload = payload
+
+        order = GroceryOrder.model_validate(order_payload)
+
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid inventory request: {exc}",
+        ) from exc
+
+    # Reuse the same inventory logic as order confirmation.
+    return _check_inventory_for_order(
+        order=order,
+        shop_id=shop_id,
+    )
+
+
 from contextlib import closing
 
 
@@ -359,10 +417,9 @@ def confirm_order(
             detail="Only new grocery orders can be confirmed here.",
         )
 
-    inventory_result = check_inventory(
+    inventory_result = _check_inventory_for_order(
         order=order,
         shop_id=shop_id,
-        api_key=api_key,
     )
 
     if inventory_result["status"] != "inventory_checked":

@@ -13,32 +13,39 @@ from backend.services.inventory_service import (
 
 
 @pytest.fixture(autouse=True)
-def use_sqlite_for_inventory_alias_tests(monkeypatch):
-    """Prevent inventory alias tests from hanging on PostgreSQL connections."""
+def use_sqlite_for_inventory_alias_tests(monkeypatch, tmp_path):
+    """Give every alias test its own isolated SQLite database."""
+
     monkeypatch.setattr(database, "DATABASE_URL", "")
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        database,
+        "DATABASE_PATH",
+        tmp_path / "voicekirana_test.db",
+    )
+
+    # Create a fresh schema in the isolated test database.
+    database.initialize_database()
 
 
 def test_biyyam_alias_resolves_to_rice():
-    with get_connection() as connection:
-        row = connection.execute(
-            """
-            SELECT i.shop_id, p.id AS product_id
-            FROM products p
-            JOIN inventory i ON i.product_id = p.id
-            JOIN shops s ON s.id = i.shop_id
-            WHERE p.normalized_name = 'rice'
-              AND s.is_active = 1
-            ORDER BY i.shop_id DESC
-            LIMIT 1
-            """
-        ).fetchone()
+    # Create test data instead of relying on an existing database record.
+    shop_id = create_shop("Alias Resolution Test Shop")
 
-    assert row is not None, "No active Rice inventory found."
+    product_id = create_product(
+        name="Rice",
+        base_unit="kg",
+    )
 
-    shop_id = row["shop_id"]
-    product_id = row["product_id"]
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=20,
+    )
 
     add_product_alias(product_id, "biyyam")
+
     results = find_inventory(shop_id, "biyyam")
 
     assert len(results) == 1
