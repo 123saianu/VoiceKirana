@@ -33,3 +33,5 @@ data/*.mp3
 # SQLite databases and backups
 data/*.db
 data/*.db-*
+
+cloudflared-diag-*.zip
