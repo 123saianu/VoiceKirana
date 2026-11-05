@@ -2,7 +2,19 @@ import hashlib
 import json
 import os
 import secrets
+from backend.models.payment import (
+    RazorpayPaymentVerificationRequest,
+)
 
+from backend.services.razorpay_service import (
+    RazorpayAPIError,
+    RazorpayConfigurationError,
+    create_razorpay_order,
+    fetch_razorpay_payment,
+    get_razorpay_public_key_id,
+    verify_payment_signature,
+    verify_webhook_signature,
+)
 from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, HTTPException, Header, Query, Request, status
 
@@ -48,17 +60,6 @@ from backend.services.razorpay_service import (
     RazorpayConfigurationError,
     create_razorpay_order,
     get_razorpay_public_key_id,
-)
-from backend.models.payment import (
-    RazorpayPaymentVerificationRequest,
-)
-from backend.services.razorpay_service import (
-    RazorpayAPIError,
-    RazorpayConfigurationError,
-    create_razorpay_order,
-    get_razorpay_public_key_id,
-    verify_payment_signature,
-    fetch_razorpay_payment,
 )
 from backend.services.inventory_service import find_inventory
 
@@ -2003,6 +2004,326 @@ def verify_customer_payment(
                 else "Payment status has been verified."
             )
         ),
+    }
+
+@app.post("/webhooks/razorpay")
+async def handle_razorpay_webhook(request: Request):
+    """
+    Receive and process verified Razorpay payment webhooks.
+
+    Security:
+    1. Verify the original raw request body.
+    2. Require Razorpay's unique event ID.
+    3. Persist each event exactly once.
+    4. Match payment identity, order and amount before updating.
+    5. Protect terminal payment states from older events.
+
+    This endpoint never accepts or reserves a grocery order.
+    """
+
+    raw_body = await request.body()
+
+    if len(raw_body) > 1_000_000:
+        raise HTTPException(
+            status_code=413,
+            detail="Webhook request body is too large.",
+        )
+
+    webhook_signature = request.headers.get("X-Razorpay-Signature")
+    event_id = request.headers.get("x-razorpay-event-id")
+
+    if not webhook_signature:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing Razorpay webhook signature.",
+        )
+
+    if not event_id or not event_id.strip() or len(event_id) > 255:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or invalid Razorpay event ID.",
+        )
+
+    event_id = event_id.strip()
+
+    # Verify the original raw bytes before parsing JSON.
+    try:
+        signature_valid = verify_webhook_signature(
+            raw_body,
+            webhook_signature,
+        )
+    except RazorpayConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay webhook verification is not configured.",
+        ) from exc
+
+    if not signature_valid:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Razorpay webhook signature.",
+        )
+
+    # Parse JSON only after signature verification.
+    try:
+        event_data = json.loads(raw_body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook JSON payload.",
+        ) from exc
+
+    if not isinstance(event_data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook payload must be a JSON object.",
+        )
+
+    event_type = event_data.get("event")
+
+    if not isinstance(event_type, str) or not event_type.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook event type is missing.",
+        )
+
+    event_type = event_type.strip()
+
+    supported_events = {
+        "payment.authorized": "authorized",
+        "payment.captured": "captured",
+        "payment.failed": "failed",
+    }
+
+    target_status = supported_events.get(event_type)
+
+    provider_payment_id = None
+    provider_order_id = None
+    provider_amount = None
+    provider_currency = None
+    failure_code = None
+    failure_description = None
+
+    payload = event_data.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+
+    payment_data = payload.get("payment")
+    if not isinstance(payment_data, dict):
+        payment_data = {}
+
+    payment_entity = payment_data.get("entity")
+    if not isinstance(payment_entity, dict):
+        payment_entity = {}
+
+    provider_payment_id = payment_entity.get("id")
+
+    if target_status is not None:
+        provider_order_id = payment_entity.get("order_id")
+        provider_amount = payment_entity.get("amount")
+        provider_currency = payment_entity.get("currency")
+        provider_status = payment_entity.get("status")
+
+        if (
+            not isinstance(provider_payment_id, str)
+            or not provider_payment_id.startswith("pay_")
+            or len(provider_payment_id) > 100
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid payment ID in webhook payload.",
+            )
+
+        if (
+            not isinstance(provider_order_id, str)
+            or not provider_order_id.startswith("order_")
+            or len(provider_order_id) > 100
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid order ID in webhook payload.",
+            )
+
+        if type(provider_amount) is not int or provider_amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid payment amount in webhook payload.",
+            )
+
+        if provider_currency != "INR":
+            raise HTTPException(
+                status_code=400,
+                detail="Unexpected payment currency in webhook payload.",
+            )
+
+        if provider_status != target_status:
+            raise HTTPException(
+                status_code=400,
+                detail="Webhook event and payment status do not match.",
+            )
+
+        if (
+            target_status == "captured"
+            and payment_entity.get("captured") is not True
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Captured event does not contain a captured payment.",
+            )
+
+        failure_code = payment_entity.get("error_code")
+        failure_description = payment_entity.get("error_description")
+
+        if failure_code is not None:
+            failure_code = str(failure_code)[:100]
+
+        if failure_description is not None:
+            failure_description = str(failure_description)[:300]
+
+        if target_status == "failed" and not failure_description:
+            failure_description = "Razorpay reported a failed payment."
+
+    duplicate = False
+    payment_updated = False
+    final_payment_status = None
+
+    # Store the event and update the payment in one transaction.
+    with closing(get_connection()) as connection:
+        with connection:
+            insert_result = connection.execute(
+                """
+                INSERT INTO razorpay_webhook_events (
+                    event_id,
+                    event_type,
+                    razorpay_payment_id
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    event_type,
+                    provider_payment_id,
+                ),
+            )
+
+            if insert_result.rowcount == 0:
+                duplicate = True
+
+            elif target_status is not None:
+                payment = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        amount_paise,
+                        currency,
+                        status,
+                        razorpay_payment_id
+                    FROM payments
+                    WHERE razorpay_order_id = ?
+                    """,
+                    (provider_order_id,),
+                ).fetchone()
+
+                if (
+                    payment is not None
+                    and payment["amount_paise"] == provider_amount
+                    and payment["currency"] == provider_currency
+                    and (
+                        payment["razorpay_payment_id"] is None
+                        or payment["razorpay_payment_id"]
+                        == provider_payment_id
+                    )
+                ):
+                    # Do not associate one Razorpay payment with
+                    # two different VoiceKirana payment attempts.
+                    existing_payment = connection.execute(
+                        """
+                        SELECT id
+                        FROM payments
+                        WHERE razorpay_payment_id = ?
+                          AND id != ?
+                        LIMIT 1
+                        """,
+                        (
+                            provider_payment_id,
+                            payment["id"],
+                        ),
+                    ).fetchone()
+
+                    if existing_payment is None:
+                        connection.execute(
+                            """
+                            UPDATE payments
+                            SET
+                                razorpay_payment_id = COALESCE(
+                                    razorpay_payment_id,
+                                    ?
+                                ),
+                                status = CASE
+                                    WHEN status IN (
+                                        'captured',
+                                        'refunded',
+                                        'failed'
+                                    ) THEN status
+                                    WHEN ? = 'captured' THEN 'captured'
+                                    WHEN ? = 'failed' THEN 'failed'
+                                    WHEN ? = 'authorized'
+                                        AND status = 'created'
+                                        THEN 'authorized'
+                                    ELSE status
+                                END,
+                                failure_code = CASE
+                                    WHEN ? = 'failed' THEN ?
+                                    ELSE failure_code
+                                END,
+                                failure_description = CASE
+                                    WHEN ? = 'failed' THEN ?
+                                    ELSE failure_description
+                                END,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (
+                                provider_payment_id,
+                                target_status,
+                                target_status,
+                                target_status,
+                                target_status,
+                                failure_code,
+                                target_status,
+                                failure_description,
+                                payment["id"],
+                            ),
+                        )
+
+                        updated_payment = connection.execute(
+                            """
+                            SELECT status
+                            FROM payments
+                            WHERE id = ?
+                            """,
+                            (payment["id"],),
+                        ).fetchone()
+
+                        final_payment_status = updated_payment["status"]
+                        payment_updated = True
+
+    if duplicate:
+        return {
+            "status": "duplicate",
+            "duplicate": True,
+            "event_id": event_id,
+            "message": "Webhook event was already processed.",
+        }
+
+    return {
+        "status": "accepted" if payment_updated else "ignored",
+        "duplicate": False,
+        "event_id": event_id,
+        "event_type": event_type,
+        "payment_updated": payment_updated,
+        "payment_status": final_payment_status,
     }
 
 

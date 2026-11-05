@@ -916,3 +916,470 @@ def test_razorpay_status_unavailable_does_not_change_payment(
     assert payment["razorpay_payment_id"] is None
 
     print("PASS: Provider error does not mark payment successful")
+
+def _build_razorpay_webhook_payload(
+    event_type,
+    payment_status,
+    payment_id="pay_test123",
+    order_id="order_test123",
+    amount=6800,
+    currency="INR",
+    captured=False,
+):
+    import json
+
+    entity = {
+        "id": payment_id,
+        "entity": "payment",
+        "order_id": order_id,
+        "amount": amount,
+        "currency": currency,
+        "status": payment_status,
+        "captured": captured,
+    }
+
+    if payment_status == "failed":
+        entity["error_code"] = "BAD_REQUEST_ERROR"
+        entity["error_description"] = "Test payment failure"
+
+    payload = {
+        "entity": "event",
+        "event": event_type,
+        "contains": ["payment"],
+        "payload": {
+            "payment": {
+                "entity": entity,
+            },
+        },
+    }
+
+    return json.dumps(payload).encode("utf-8")
+
+
+def _send_razorpay_webhook(
+    client,
+    raw_body,
+    event_id="event_test_001",
+):
+    return client.post(
+        "/webhooks/razorpay",
+        content=raw_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Razorpay-Signature": "b" * 64,
+            **(
+                {"x-razorpay-event-id": event_id}
+                if event_id is not None
+                else {}
+            ),
+        },
+    )
+
+
+def _get_webhook_event_count():
+    with closing(database.get_connection()) as connection:
+        return connection.execute(
+            "SELECT COUNT(*) AS total FROM razorpay_webhook_events"
+        ).fetchone()["total"]
+
+
+def test_valid_captured_webhook_updates_payment(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-captured@example.com",
+    )
+
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    signature_mock = Mock(return_value=True)
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        signature_mock,
+    )
+
+    response = _send_razorpay_webhook(client, raw_body)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["payment_updated"] is True
+    assert response.json()["payment_status"] == "captured"
+
+    signature_mock.assert_called_once_with(
+        raw_body,
+        "b" * 64,
+    )
+
+    payment = get_payment_record(created["payment_id"])
+
+    assert payment["status"] == "captured"
+    assert payment["razorpay_payment_id"] == "pay_test123"
+
+    with closing(database.get_connection()) as connection:
+        saved_order = connection.execute(
+            "SELECT status FROM orders WHERE id = ?",
+            (order["order_id"],),
+        ).fetchone()
+
+    assert saved_order["status"] == "pending"
+    assert _get_webhook_event_count() == 1
+
+    print("PASS: Captured webhook updates payment without accepting grocery order")
+
+
+def test_invalid_webhook_signature_is_rejected(
+    client,
+    monkeypatch,
+):
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    signature_mock = Mock(return_value=False)
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        signature_mock,
+    )
+
+    response = _send_razorpay_webhook(client, raw_body)
+
+    assert response.status_code == 400
+    assert _get_webhook_event_count() == 0
+
+    print("PASS: Invalid webhook signature rejected")
+
+
+def test_missing_webhook_event_id_is_rejected(
+    client,
+    monkeypatch,
+):
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    signature_mock = Mock(return_value=True)
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        signature_mock,
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        event_id=None,
+    )
+
+    assert response.status_code == 400
+    signature_mock.assert_not_called()
+    assert _get_webhook_event_count() == 0
+
+    print("PASS: Missing webhook event ID rejected")
+
+
+def test_duplicate_webhook_event_is_not_processed_twice(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-duplicate@example.com",
+    )
+
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    first = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_duplicate_001",
+    )
+
+    second = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_duplicate_001",
+    )
+
+    assert first.status_code == 200
+    assert first.json()["payment_updated"] is True
+
+    assert second.status_code == 200
+    assert second.json()["status"] == "duplicate"
+    assert second.json()["duplicate"] is True
+
+    assert _get_webhook_event_count() == 1
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "captured"
+
+    print("PASS: Duplicate webhook event ignored")
+
+
+def test_webhook_amount_mismatch_does_not_update_payment(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-amount-mismatch@example.com",
+    )
+
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        amount=9999,
+        captured=True,
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_amount_mismatch",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    assert response.json()["payment_updated"] is False
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "created"
+    assert payment["razorpay_payment_id"] is None
+
+    print("PASS: Webhook with incorrect amount cannot update payment")
+
+
+def test_authorized_webhook_can_be_followed_by_captured_webhook(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-authorized-captured@example.com",
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    authorized_body = _build_razorpay_webhook_payload(
+        "payment.authorized",
+        "authorized",
+        captured=False,
+    )
+
+    first = _send_razorpay_webhook(
+        client,
+        authorized_body,
+        "event_authorized_001",
+    )
+
+    assert first.status_code == 200
+    assert first.json()["payment_status"] == "authorized"
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "authorized"
+
+    captured_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    second = _send_razorpay_webhook(
+        client,
+        captured_body,
+        "event_captured_001",
+    )
+
+    assert second.status_code == 200
+    assert second.json()["payment_status"] == "captured"
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "captured"
+
+    print("PASS: Authorized payment can transition to captured")
+
+
+def test_delayed_failed_webhook_does_not_downgrade_captured_payment(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-out-of-order@example.com",
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    captured_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "captured",
+        captured=True,
+    )
+
+    first = _send_razorpay_webhook(
+        client,
+        captured_body,
+        "event_captured_first",
+    )
+
+    assert first.status_code == 200
+    assert first.json()["payment_status"] == "captured"
+
+    delayed_failed_body = _build_razorpay_webhook_payload(
+        "payment.failed",
+        "failed",
+        captured=False,
+    )
+
+    second = _send_razorpay_webhook(
+        client,
+        delayed_failed_body,
+        "event_failed_delayed",
+    )
+
+    assert second.status_code == 200
+    assert second.json()["payment_status"] == "captured"
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "captured"
+
+    print("PASS: Delayed failed event does not downgrade captured payment")
+
+
+def test_failed_webhook_records_failure_details(
+    client,
+    monkeypatch,
+):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        "webhook-failed@example.com",
+    )
+
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.failed",
+        "failed",
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_payment_failed",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["payment_status"] == "failed"
+
+    payment = get_payment_record(created["payment_id"])
+
+    assert payment["status"] == "failed"
+    assert payment["failure_code"] == "BAD_REQUEST_ERROR"
+    assert payment["failure_description"] == "Test payment failure"
+
+    print("PASS: Failed webhook records provider failure details")
+
+
+def test_unsupported_webhook_event_is_acknowledged_without_payment_update(
+    client,
+    monkeypatch,
+):
+    import json
+
+    raw_body = json.dumps({
+        "entity": "event",
+        "event": "order.paid",
+        "payload": {},
+    }).encode("utf-8")
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_unsupported_001",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    assert response.json()["payment_updated"] is False
+    assert _get_webhook_event_count() == 1
+
+    print("PASS: Unsupported webhook event safely acknowledged")
+
+
+def test_mismatched_event_and_payment_status_are_rejected(
+    client,
+    monkeypatch,
+):
+    raw_body = _build_razorpay_webhook_payload(
+        "payment.captured",
+        "authorized",
+        captured=False,
+    )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        "event_status_mismatch",
+    )
+
+    assert response.status_code == 400
+    assert _get_webhook_event_count() == 0
+
+    print("PASS: Mismatched webhook event and payment status rejected")
