@@ -43,6 +43,23 @@ from backend.services.catalogue_service import (
     update_shop_inventory,
     add_shop_product_alias,
 )
+from backend.services.razorpay_service import (
+    RazorpayAPIError,
+    RazorpayConfigurationError,
+    create_razorpay_order,
+    get_razorpay_public_key_id,
+)
+from backend.models.payment import (
+    RazorpayPaymentVerificationRequest,
+)
+from backend.services.razorpay_service import (
+    RazorpayAPIError,
+    RazorpayConfigurationError,
+    create_razorpay_order,
+    get_razorpay_public_key_id,
+    verify_payment_signature,
+    fetch_razorpay_payment,
+)
 from backend.services.inventory_service import find_inventory
 
 
@@ -1468,6 +1485,525 @@ def get_customer_order(
 
         return _load_order_details(connection, order_row)
 
+@app.post(
+    "/customers/orders/{order_reference}/payments",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_customer_payment(
+    order_reference: str,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Create a Razorpay payment attempt for a customer's own order."""
+
+    if not idempotency_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required.",
+        )
+
+    idempotency_key = idempotency_key.strip()
+
+    if not idempotency_key or len(idempotency_key) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must contain between 1 and 200 characters.",
+        )
+
+    customer_id = current_customer["customer_id"]
+
+    try:
+        key_id = get_razorpay_public_key_id()
+    except RazorpayConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay payment configuration is unavailable.",
+        ) from exc
+
+    # Only retrieve an order owned by this authenticated customer.
+    with closing(get_connection()) as connection:
+        order = connection.execute(
+            """
+            SELECT
+                o.id,
+                o.order_reference,
+                o.status,
+                o.total_amount
+            FROM orders AS o
+            JOIN customer_order_ownership AS ownership
+                ON ownership.order_id = o.id
+            WHERE o.order_reference = ?
+              AND ownership.customer_id = ?
+            """,
+            (order_reference, customer_id),
+        ).fetchone()
+
+        if order is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Order not found.",
+            )
+
+        if order["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Only pending orders can start a payment.",
+            )
+
+        amount_paise = order["total_amount"]
+
+        if type(amount_paise) is not int or amount_paise < 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Order amount must be at least ₹1.00 to accept payment.",
+            )
+
+        # Reuse the original payment order for an identical retry.
+        existing = connection.execute(
+            """
+            SELECT
+                id,
+                razorpay_order_id,
+                amount_paise,
+                status
+            FROM payments
+            WHERE order_id = ?
+              AND customer_id = ?
+              AND idempotency_key = ?
+            """,
+            (order["id"], customer_id, idempotency_key),
+        ).fetchone()
+
+        if existing is not None:
+            if existing["status"] in {
+                "created",
+                "authorized",
+                "captured",
+            } and existing["razorpay_order_id"]:
+                return {
+                    "payment_id": existing["id"],
+                    "order_reference": order_reference,
+                    "razorpay_order_id": existing["razorpay_order_id"],
+                    "amount_paise": existing["amount_paise"],
+                    "currency": "INR",
+                    "key_id": key_id,
+                    "status": existing["status"],
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This payment attempt cannot be safely repeated. "
+                    "Check its payment status before starting another attempt."
+                ),
+            )
+
+        # Do not create a second active payment session for this order.
+        active_payment = connection.execute(
+            """
+            SELECT id, status
+            FROM payments
+            WHERE order_id = ?
+              AND status IN (
+                  'creating',
+                  'created',
+                  'authorized',
+                  'captured',
+                  'refunded'
+              )
+            LIMIT 1
+            """,
+            (order["id"],),
+        ).fetchone()
+
+        if active_payment is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "An active payment attempt already exists for this order. "
+                    "Reuse its existing payment session."
+                ),
+            )
+
+        order_id = order["id"]
+
+    # Claim the payment attempt in the database before calling Razorpay.
+    try:
+        with closing(get_connection()) as connection:
+            with connection:
+                payment_id = connection.insert_returning_id(
+                    """
+                    INSERT INTO payments (
+                        order_id,
+                        customer_id,
+                        idempotency_key,
+                        amount_paise,
+                        currency,
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, 'INR', 'creating')
+                    """,
+                    (
+                        order_id,
+                        customer_id,
+                        idempotency_key,
+                        amount_paise,
+                    ),
+                )
+
+    except Exception as exc:
+        # The database's partial unique index prevents concurrent
+        # active attempts for the same order.
+        with closing(get_connection()) as connection:
+            active = connection.execute(
+                """
+                SELECT id, status
+                FROM payments
+                WHERE order_id = ?
+                  AND status IN (
+                      'creating',
+                      'created',
+                      'authorized',
+                      'captured',
+                      'refunded'
+                  )
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Another payment attempt was created concurrently.",
+            ) from exc
+
+        raise
+
+    # Use the internal payment ID to create a unique Razorpay receipt.
+    receipt = f"VKP-{payment_id}"
+
+    try:
+        razorpay_result = create_razorpay_order(
+            amount_paise=amount_paise,
+            receipt=receipt,
+            notes={
+                "voicekirana_payment_id": str(payment_id),
+                "order_reference": order_reference,
+            },
+        )
+
+    except RazorpayAPIError as exc:
+        # A definite 4xx rejection means Razorpay rejected creation.
+        # A timeout or 5xx response is ambiguous, so keep status
+        # 'creating' to prevent an unsafe duplicate attempt.
+        if (
+            exc.status_code is not None
+            and 400 <= exc.status_code < 500
+        ):
+            with closing(get_connection()) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE payments
+                        SET
+                            status = 'creation_failed',
+                            failure_description = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                          AND status = 'creating'
+                        """,
+                        (str(exc)[:300], payment_id),
+                    )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Razorpay could not confirm payment-order creation. "
+                "Check the payment attempt before retrying."
+            ),
+        ) from exc
+
+    with closing(get_connection()) as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE payments
+                SET
+                    razorpay_order_id = ?,
+                    status = 'created',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status = 'creating'
+                """,
+                (
+                    razorpay_result["razorpay_order_id"],
+                    payment_id,
+                ),
+            )
+
+    return {
+        "payment_id": payment_id,
+        "order_reference": order_reference,
+        "razorpay_order_id": razorpay_result["razorpay_order_id"],
+        "amount_paise": amount_paise,
+        "currency": "INR",
+        "key_id": key_id,
+        "status": "created",
+    }
+
+
+@app.post("/customers/orders/{order_reference}/payments/verify")
+def verify_customer_payment(
+    order_reference: str,
+    payload: RazorpayPaymentVerificationRequest,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """
+    Verify a customer's Razorpay Checkout response.
+
+    Payment is marked captured only after:
+    1. Checkout signature verification.
+    2. Server-side Razorpay payment retrieval.
+    3. Order ID, amount, currency and capture-status checks.
+    """
+
+    customer_id = current_customer["customer_id"]
+
+    # Retrieve the payment using the authenticated customer's
+    # ownership and the payment's server-stored Razorpay order ID.
+    with closing(get_connection()) as connection:
+        payment = connection.execute(
+            """
+            SELECT
+                p.id,
+                p.order_id,
+                p.customer_id,
+                p.razorpay_order_id,
+                p.razorpay_payment_id,
+                p.amount_paise,
+                p.currency,
+                p.status
+            FROM payments AS p
+            JOIN orders AS o
+                ON o.id = p.order_id
+            JOIN customer_order_ownership AS ownership
+                ON ownership.order_id = o.id
+            WHERE o.order_reference = ?
+              AND ownership.customer_id = ?
+              AND p.customer_id = ?
+              AND p.razorpay_order_id = ?
+            ORDER BY p.id DESC
+            LIMIT 1
+            """,
+            (
+                order_reference,
+                customer_id,
+                customer_id,
+                payload.razorpay_order_id,
+            ),
+        ).fetchone()
+
+    if payment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment attempt not found.",
+        )
+    if (
+        payment["razorpay_payment_id"] is not None
+        and payment["razorpay_payment_id"] != payload.razorpay_payment_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A different Razorpay payment ID is already associated with this attempt.",
+        )
+    if payment["status"] in {"creating", "creation_failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail="This payment attempt is not ready for verification.",
+        )
+
+    if payment["status"] == "refunded":
+        raise HTTPException(
+            status_code=409,
+            detail="This payment has already been refunded.",
+        )
+
+    # Never allow a different payment ID to replace an already
+    # captured payment.
+    if (
+        payment["status"] == "captured"
+        and payment["razorpay_payment_id"] != payload.razorpay_payment_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A different payment has already been captured.",
+        )
+
+    # Verify against the order ID stored by our backend.
+    try:
+        signature_valid = verify_payment_signature(
+            payment["razorpay_order_id"],
+            payload.razorpay_payment_id,
+            payload.razorpay_signature,
+        )
+    except RazorpayConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Payment verification is not configured.",
+        ) from exc
+
+    if not signature_valid:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Razorpay payment signature.",
+        )
+
+    # An already recorded successful verification is idempotent.
+    if (
+        payment["status"] == "captured"
+        and payment["razorpay_payment_id"] == payload.razorpay_payment_id
+    ):
+        return {
+            "status": "captured",
+            "payment_id": payment["id"],
+            "order_reference": order_reference,
+            "razorpay_payment_id": payload.razorpay_payment_id,
+            "amount_paise": payment["amount_paise"],
+            "currency": payment["currency"],
+            "captured": True,
+            "message": "Payment has already been verified and captured.",
+        }
+
+    # Independently fetch payment details from Razorpay.
+    try:
+        provider_payment = fetch_razorpay_payment(
+            payload.razorpay_payment_id
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Razorpay payment identifier.",
+        ) from exc
+    except RazorpayAPIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not verify payment status with Razorpay.",
+        ) from exc
+
+    # Compare all critical values with our saved payment attempt.
+    if (
+        provider_payment["razorpay_order_id"]
+        != payment["razorpay_order_id"]
+        or provider_payment["amount_paise"]
+        != payment["amount_paise"]
+        or provider_payment["currency"] != "INR"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Razorpay payment details do not match "
+                "the saved VoiceKirana payment."
+            ),
+        )
+
+    provider_status = provider_payment["status"]
+    provider_captured = provider_payment["captured"]
+
+    if provider_status == "captured" and provider_captured:
+        new_status = "captured"
+
+    elif provider_status == "authorized":
+        new_status = "authorized"
+
+    elif provider_status == "failed":
+        new_status = "failed"
+
+    elif provider_status == "refunded":
+        new_status = "refunded"
+
+    else:
+        new_status = "created"
+
+    failure_description = (
+        "Razorpay reported that this payment failed."
+        if new_status == "failed"
+        else None
+    )
+
+    # Never downgrade a captured/refunded payment if a delayed
+    # verification request races with another status update.
+    with closing(get_connection()) as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE payments
+                SET
+                    razorpay_payment_id = COALESCE(
+                        razorpay_payment_id,
+                        ?
+                    ),
+                    status = CASE
+                        WHEN status = 'refunded' THEN 'refunded'
+                        WHEN status = 'captured' THEN 'captured'
+                        WHEN ? = 'captured' THEN 'captured'
+                        WHEN ? = 'refunded' THEN 'refunded'
+                        WHEN ? = 'authorized' THEN 'authorized'
+                        WHEN ? = 'failed' THEN 'failed'
+                        ELSE status
+                    END,
+                    failure_description = CASE
+                        WHEN ? = 'failed' THEN ?
+                        ELSE failure_description
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    payload.razorpay_payment_id,
+                    new_status,
+                    new_status,
+                    new_status,
+                    new_status,
+                    new_status,
+                    failure_description,
+                    payment["id"],
+                ),
+            )
+
+            updated_payment = connection.execute(
+                """
+                SELECT status, razorpay_payment_id
+                FROM payments
+                WHERE id = ?
+                """,
+                (payment["id"],),
+            ).fetchone()
+
+    final_status = updated_payment["status"]
+    captured = final_status == "captured"
+
+    return {
+        "status": final_status,
+        "payment_id": payment["id"],
+        "order_reference": order_reference,
+        "razorpay_payment_id": updated_payment["razorpay_payment_id"],
+        "amount_paise": payment["amount_paise"],
+        "currency": payment["currency"],
+        "captured": captured,
+        "message": (
+            "Payment successfully verified and captured."
+            if captured
+            else (
+                "Payment is authorized but has not yet been captured."
+                if final_status == "authorized"
+                else "Payment status has been verified."
+            )
+        ),
+    }
 
 
 # ============================================================

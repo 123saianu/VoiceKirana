@@ -252,6 +252,51 @@ def initialize_database():
             ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        customer_id INTEGER NOT NULL,
+
+        idempotency_key TEXT NOT NULL,
+
+        razorpay_order_id TEXT UNIQUE,
+        razorpay_payment_id TEXT UNIQUE,
+
+        amount_paise INTEGER NOT NULL
+            CHECK (amount_paise > 0),
+
+        currency TEXT NOT NULL DEFAULT 'INR'
+            CHECK (currency = 'INR'),
+
+        status TEXT NOT NULL DEFAULT 'creating'
+            CHECK (status IN (
+                'creating',
+                'created',
+                'authorized',
+                'captured',
+                'failed',
+                'creation_failed',
+                'refunded'
+            )),
+
+        failure_code TEXT,
+        failure_description TEXT,
+
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (order_id)
+            REFERENCES orders(id)
+            ON DELETE CASCADE,
+
+        FOREIGN KEY (customer_id)
+            REFERENCES customers(id)
+            ON DELETE CASCADE,
+
+        UNIQUE (order_id, idempotency_key)
+    );
+
+
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER NOT NULL,
@@ -272,6 +317,27 @@ def initialize_database():
 
     CREATE INDEX IF NOT EXISTS idx_customer_order_ownership_customer
         ON customer_order_ownership(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_payments_customer_created
+        ON payments(customer_id, created_at);
+
+    CREATE INDEX IF NOT EXISTS idx_payments_order
+        ON payments(order_id);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_one_active_per_order
+        ON payments(order_id)
+        WHERE status IN (
+            'creating',
+            'created',
+            'authorized',
+            'captured',
+            'refunded'
+        );
+    CREATE TABLE IF NOT EXISTS razorpay_webhook_events (
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        razorpay_payment_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     """
 
     if DATABASE_URL:
