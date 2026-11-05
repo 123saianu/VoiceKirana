@@ -133,6 +133,16 @@ def initialize_database():
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        full_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1
+            CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS shop_memberships (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -226,6 +236,22 @@ def initialize_database():
         FOREIGN KEY (order_id) REFERENCES orders(id)
     );
 
+    CREATE TABLE IF NOT EXISTS customer_order_ownership (
+        order_id INTEGER NOT NULL,
+        customer_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        PRIMARY KEY (order_id),
+
+        FOREIGN KEY (order_id)
+            REFERENCES orders(id)
+            ON DELETE CASCADE,
+
+        FOREIGN KEY (customer_id)
+            REFERENCES customers(id)
+            ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER NOT NULL,
@@ -243,6 +269,9 @@ def initialize_database():
 
     CREATE INDEX IF NOT EXISTS idx_orders_shop_status
         ON orders(shop_id, status);
+
+    CREATE INDEX IF NOT EXISTS idx_customer_order_ownership_customer
+        ON customer_order_ownership(customer_id);
     """
 
     if DATABASE_URL:
@@ -268,6 +297,10 @@ def initialize_database():
         schema = schema.replace(
             "user_id INTEGER NOT NULL",
             "user_id BIGINT NOT NULL",
+        )
+        schema = schema.replace(
+            "customer_id INTEGER NOT NULL",
+            "customer_id BIGINT NOT NULL",
         )
 
     with get_connection() as connection:

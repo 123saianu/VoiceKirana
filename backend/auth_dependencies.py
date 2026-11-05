@@ -107,6 +107,56 @@ def get_current_user(
     }
 
 
+def get_current_customer(
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
+) -> dict:
+    """Validate a customer JWT and retrieve the active customer."""
+
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Bearer authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        customer_id = decode_access_token(
+            credentials.credentials,
+            expected_principal_type="customer",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired customer access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    with closing(get_connection()) as connection:
+        customer = connection.execute(
+            """
+            SELECT id, email, full_name, is_active
+            FROM customers
+            WHERE id = ?
+            """,
+            (customer_id,),
+        ).fetchone()
+
+    if customer is None or not customer["is_active"]:
+        raise HTTPException(
+            status_code=401,
+            detail="Customer account is inactive or no longer exists.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return {
+        "customer_id": customer["id"],
+        "email": customer["email"],
+        "full_name": customer["full_name"],
+    }
+
+
 def authorize_shop_access(
     current_user: dict,
     shop_id: int,

@@ -9,6 +9,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Header, Query, Reques
 from backend.auth_dependencies import (
     authenticate_admin_token,
     get_current_user,
+    get_current_customer,
     require_shop_access,
 )
 from backend.database import get_connection
@@ -18,6 +19,10 @@ from backend.models.auth import (
     AdminCreateShopOwnerRequest,
     AccessTokenResponse,
     CurrentUserResponse,
+)
+from backend.models.customer import (
+    CustomerRegisterRequest,
+    CustomerProfileResponse,
 )
 from backend.models.catalogue import (
     ShopProductCreate,
@@ -29,6 +34,7 @@ from backend.security import (
     hash_password,
     verify_password,
     create_access_token,
+    create_dummy_password_hash,
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from backend.services.catalogue_service import (
@@ -489,6 +495,7 @@ def _save_confirmed_order(
     inventory_result: dict,
     idempotency_key: str | None = None,
     request_fingerprint: str | None = None,
+    customer_id: int | None = None,
 ) -> dict:
     """
     Save the order and, when supplied, its idempotency record
@@ -598,7 +605,18 @@ def _save_confirmed_order(
                         item["line_total_paise"],
                     ),
                 )
-
+            # Link this order to its customer when customer-authenticated.
+            if customer_id is not None:
+                connection.execute(
+                    """
+                    INSERT INTO customer_order_ownership (
+                        order_id,
+                        customer_id
+                    )
+                    VALUES (?, ?)
+                    """,
+                    (order_id, customer_id),
+                )
             response = {
                 "status": "pending",
                 "message": (
@@ -1172,6 +1190,284 @@ def get_my_profile(
     """
 
     return current_user
+
+
+@app.post(
+    "/customers/register",
+    response_model=CustomerProfileResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_customer(payload: CustomerRegisterRequest):
+    """Register a new independent customer account."""
+
+    password_hash = hash_password(payload.password)
+
+    with closing(get_connection()) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO customers (
+                    email,
+                    full_name,
+                    password_hash
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT (email) DO NOTHING
+                """,
+                (
+                    payload.email,
+                    payload.full_name,
+                    password_hash,
+                ),
+            )
+
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="An account with this email already exists.",
+                )
+
+            customer = connection.execute(
+                """
+                SELECT id, email, full_name
+                FROM customers
+                WHERE email = ?
+                """,
+                (payload.email,),
+            ).fetchone()
+
+    return {
+        "customer_id": customer["id"],
+        "email": customer["email"],
+        "full_name": customer["full_name"],
+    }
+
+
+@app.post("/customers/login", response_model=AccessTokenResponse)
+def customer_login(payload: LoginRequest):
+    """Authenticate a customer and issue a customer-specific JWT."""
+
+    with closing(get_connection()) as connection:
+        customer = connection.execute(
+            """
+            SELECT
+                id,
+                email,
+                full_name,
+                password_hash,
+                is_active
+            FROM customers
+            WHERE email = ?
+            """,
+            (payload.email,),
+        ).fetchone()
+
+    # Verify a real or dummy hash to reduce email-enumeration
+    # timing differences between existing and unknown accounts.
+    stored_hash = (
+        customer["password_hash"]
+        if customer is not None
+        else create_dummy_password_hash()
+    )
+
+    password_valid = verify_password(
+        payload.password,
+        stored_hash,
+    )
+
+    if (
+        customer is None
+        or not customer["is_active"]
+        or not password_valid
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(
+        customer["id"],
+        principal_type="customer",
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+@app.get(
+    "/customers/me",
+    response_model=CustomerProfileResponse,
+)
+def get_customer_profile(
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Return the authenticated customer's profile."""
+
+    return current_customer
+
+@app.post("/customers/orders/confirm", status_code=status.HTTP_201_CREATED)
+def confirm_customer_order(
+    order: GroceryOrder,
+    shop_id: int = Query(gt=0),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+    current_customer: dict = Depends(get_current_customer),
+):
+    """
+    Confirm a grocery order for the authenticated customer.
+
+    Customer identity is attached to the order transaction.
+    Idempotency keys are scoped to individual customers.
+    """
+
+    if order.intent != "place_order":
+        raise HTTPException(
+            status_code=400,
+            detail="Only new grocery orders can be confirmed here.",
+        )
+
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required.",
+        )
+
+    idempotency_key = idempotency_key.strip()
+
+    if not idempotency_key or len(idempotency_key) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must contain between 1 and 200 characters.",
+        )
+
+    customer_id = current_customer["customer_id"]
+
+    # Create a customer-specific key so different customers
+    # cannot retrieve each other's idempotent responses.
+    scoped_key = hashlib.sha256(
+        f"customer:{customer_id}:{idempotency_key}".encode("utf-8")
+    ).hexdigest()
+
+    request_fingerprint = _order_request_fingerprint(order)
+
+    existing_response = _get_idempotent_response(
+        shop_id=shop_id,
+        idempotency_key=scoped_key,
+        request_fingerprint=request_fingerprint,
+    )
+
+    if existing_response is not None:
+        return existing_response
+
+    inventory_result = _check_inventory_for_order(
+        order=order,
+        shop_id=shop_id,
+    )
+
+    if inventory_result["status"] != "inventory_checked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "The order was not saved because some items "
+                    "need attention or inventory could not be confirmed."
+                ),
+                "inventory_result": inventory_result,
+            },
+        )
+
+    return _save_confirmed_order(
+        shop_id=shop_id,
+        inventory_result=inventory_result,
+        idempotency_key=scoped_key,
+        request_fingerprint=request_fingerprint,
+        customer_id=customer_id,
+    )
+
+
+@app.get("/customers/orders")
+def get_customer_order_history(
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Return only orders belonging to the authenticated customer."""
+
+    customer_id = current_customer["customer_id"]
+
+    with closing(get_connection()) as connection:
+        order_rows = connection.execute(
+            """
+            SELECT
+                o.id,
+                o.order_reference,
+                o.shop_id,
+                o.status,
+                o.total_amount,
+                o.created_at
+            FROM orders AS o
+            JOIN customer_order_ownership AS ownership
+                ON ownership.order_id = o.id
+            WHERE ownership.customer_id = ?
+            ORDER BY o.id DESC
+            """,
+            (customer_id,),
+        ).fetchall()
+
+        orders = [
+            _load_order_details(connection, order_row)
+            for order_row in order_rows
+        ]
+
+    return {
+        "customer_id": customer_id,
+        "count": len(orders),
+        "orders": orders,
+    }
+
+
+@app.get("/customers/orders/{order_reference}")
+def get_customer_order(
+    order_reference: str,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """
+    Retrieve one order only when it belongs to the authenticated customer.
+    """
+
+    customer_id = current_customer["customer_id"]
+
+    with closing(get_connection()) as connection:
+        order_row = connection.execute(
+            """
+            SELECT
+                o.id,
+                o.order_reference,
+                o.shop_id,
+                o.status,
+                o.total_amount,
+                o.created_at
+            FROM orders AS o
+            JOIN customer_order_ownership AS ownership
+                ON ownership.order_id = o.id
+            WHERE o.order_reference = ?
+              AND ownership.customer_id = ?
+            """,
+            (order_reference, customer_id),
+        ).fetchone()
+
+        if order_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Order not found.",
+            )
+
+        return _load_order_details(connection, order_row)
+
 
 
 # ============================================================

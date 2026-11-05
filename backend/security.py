@@ -1,6 +1,7 @@
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 import jwt
 from dotenv import load_dotenv
@@ -53,6 +54,7 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def create_dummy_password_hash() -> str:
     """
     Create a dummy hash for login attempts with unknown email addresses.
@@ -65,10 +67,16 @@ def create_dummy_password_hash() -> str:
     )
 
 
-def create_access_token(user_id: int) -> str:
-    """Create a signed, time-limited JWT for a shop owner."""
+def create_access_token(
+    user_id: int,
+    principal_type: str = "shop_owner",
+) -> str:
+    """Create a signed, time-limited JWT for a shop owner or customer."""
     if not isinstance(user_id, int) or user_id <= 0:
         raise ValueError("A valid user ID is required.")
+
+    if principal_type not in {"shop_owner", "customer"}:
+        raise ValueError("Invalid account type.")
 
     now = datetime.now(timezone.utc)
 
@@ -78,6 +86,7 @@ def create_access_token(user_id: int) -> str:
         "iat": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
         "token_type": "access",
+        "principal_type": principal_type,
     }
 
     return jwt.encode(
@@ -87,7 +96,10 @@ def create_access_token(user_id: int) -> str:
     )
 
 
-def decode_access_token(token: str) -> int:
+def decode_access_token(
+    token: str,
+    expected_principal_type: str = "shop_owner",
+) -> int:
     """
     Verify a JWT and return its user ID.
 
@@ -106,6 +118,14 @@ def decode_access_token(token: str) -> int:
 
         if payload.get("token_type") != "access":
             raise InvalidTokenError("Incorrect token type.")
+
+        principal_type = payload.get(
+            "principal_type",
+            "shop_owner",
+        )
+
+        if principal_type != expected_principal_type:
+            raise InvalidTokenError("Incorrect account type.")
 
         user_id = int(payload["sub"])
 
