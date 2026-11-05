@@ -212,6 +212,20 @@ def initialize_database():
         FOREIGN KEY (shop_id) REFERENCES shops(id)
     );
 
+    CREATE TABLE IF NOT EXISTS order_idempotency (
+        shop_id INTEGER NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        order_id BIGINT,
+        response_json TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        PRIMARY KEY (shop_id, idempotency_key),
+
+        FOREIGN KEY (shop_id) REFERENCES shops(id),
+        FOREIGN KEY (order_id) REFERENCES orders(id)
+    );
+
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER NOT NULL,
