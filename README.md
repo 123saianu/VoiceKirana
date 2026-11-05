@@ -1,428 +1,291 @@
-<<<<<<< HEAD
-# VoiceKirana
-=======
-\# VoiceKirana — Voice-Based Grocery Ordering Assistant
+# VoiceKirana — Multilingual AI Grocery Ordering Assistant
 
+VoiceKirana is a multilingual grocery ordering assistant designed to make grocery shopping easier through natural-language interactions, inventory verification, and order management.
 
+The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQLite database support, and Gnani AI speech services.
 
-VoiceKirana is a Python-based grocery assistant that helps users check grocery availability and estimated prices through a Streamlit interface. It integrates a FastAPI backend, an inventory catalogue backed by SQLite, and Gnani Timbre text-to-speech for spoken responses.
+## Features
 
+### Grocery ordering
+- Create a cart containing multiple grocery items.
+- Support product names, quantities, units, brands, and variants.
+- Handle English, Telugu, Hindi, and multilingual grocery requests.
+- Validate customer requests before inventory checking.
+- Identify unavailable products, ambiguous matches, and insufficient stock.
 
+### Inventory management
+- Shop-specific product catalogues.
+- Product aliases for alternate and regional names.
+- Shop-specific pricing and stock information.
+- Inventory verification before order confirmation.
 
-\## Features
+### Order management
+- Save pending grocery orders.
+- Generate unique order references.
+- Retrieve individual orders and order history.
+- Cancel pending orders.
+- Idempotent order confirmation using an optional `Idempotency-Key`.
+- Prevent duplicate orders from simultaneous requests.
+- Preserve order records when transactions fail.
 
+**Important:** Saving an order does not reserve inventory or guarantee shop acceptance. Payment and delivery are separate workflows.
 
+### Voice and AI
+- Gnani Timbre text-to-speech integration.
+- Spoken responses for inventory results.
+- Integration foundation for multilingual conversational ordering through Gnani AI.
 
-\- Interactive Streamlit interface for grocery requests.
+### Authentication and security
+- API-key authentication.
+- Shop-owner registration and login.
+- Argon2 password hashing.
+- JWT-based access tokens.
+- Shop membership and role-based authorization.
+- Separate administrator authentication.
 
-\- FastAPI endpoints for order preview and inventory checks.
+### Database
+- SQLite support for local development.
+- PostgreSQL support for deployment.
+- Database transactions and rollback.
+- Foreign-key and check constraints.
+- PostgreSQL idempotency and concurrency protection.
 
-\- SQLite-based shop, product, price, and stock management.
+## Technology Stack
 
-\- Product matching using catalogue names and aliases.
+| Component | Technology |
+|---|---|
+| Backend | Python, FastAPI |
+| Frontend | Streamlit |
+| Database | PostgreSQL, SQLite |
+| Database driver | Psycopg |
+| Validation | Pydantic |
+| Authentication | JWT, Argon2 |
+| AI and speech | Gnani AI |
+| HTTP requests | Requests |
+| Testing | Pytest |
+| Configuration | Python-dotenv |
 
-\- Validation for unknown products, unit mismatches, and insufficient stock.
-
-\- Gnani Timbre text-to-speech for audio responses.
-
-\- API-key authentication for protected backend endpoints.
-
-\- Automated tests for API behavior, inventory logic, and speech synthesis.
-
-
-
-\*\*Important:\*\* VoiceKirana currently checks availability and estimated prices. It does not reserve inventory or place an actual grocery order.
-
-
-
-\## Technology Stack
-
-
-
-\- Python
-
-\- FastAPI and Uvicorn
-
-\- Streamlit
-
-\- SQLite
-
-\- Pydantic
-
-\- Requests
-
-\- Python-dotenv
-
-\- Gnani Timbre TTS
-
-\- Pytest and Coverage
-
-
-
-\## Project Structure
-
-
+## Project Structure
 
 ```text
-
 VoiceKirana/
-
 ├── backend/
-
 │   ├── main.py
-
 │   ├── database.py
-
+│   ├── auth_dependencies.py
+│   ├── security.py
 │   ├── models/
-
-│   └── services/
-
-│       ├── inventory\_service.py
-
-│       └── timbre\_service.py
-
+│   ├── services/
+│   └── test_*.py
 ├── frontend/
-
 │   └── app.py
-
-├── tests/
-
 ├── data/
-
-├── .env
-
+├── requirements.txt
+├── .env.example
 ├── .gitignore
-
 └── README.md
-
 ```
 
+## Prerequisites
 
+- Python 3.11 or later.
+- Git.
+- Gnani AI credentials for speech services.
+- A configured VoiceKirana API token.
+- PostgreSQL connection details when using PostgreSQL.
 
-The structure above highlights the main application files; additional files may exist in the repository.
-
-
-
-\## Prerequisites
-
-
-
-\- Python installed on your computer.
-
-\- A configured Gnani API key ID for Timbre TTS.
-
-\- A configured VoiceKirana backend API token.
-
-
-
-\## Local Setup
-
-
+## Local Installation
 
 Open PowerShell in the project directory:
 
-
-
 ```powershell
-
-cd C:\\Users\\DELL\\Documents\\VoiceKirana
-
+cd C:\Users\DELL\Documents\VoiceKirana
 ```
 
-
-
-Activate the existing virtual environment:
-
-
+Activate the virtual environment:
 
 ```powershell
-
-.\\.venv\\Scripts\\Activate.ps1
-
+.\venv\Scripts\Activate.ps1
 ```
 
-
-
-If the virtual environment has not been created, create and activate it:
-
-
+Install the dependencies:
 
 ```powershell
-
-python -m venv .venv
-
-.\\.venv\\Scripts\\Activate.ps1
-
-```
-
-
-
-Install project dependencies:
-
-
-
-```powershell
-
 python -m pip install -r requirements.txt
-
 ```
 
+## Environment Configuration
 
+Create a local `.env` file using `.env.example` as the reference.
 
-\## Environment Variables
+Configure these variables:
 
+```env
+BACKEND_URL=http://localhost:8001
+APP_NAME=VoiceKirana
 
+GNANI_API_KEY_ID=your-gnani-key-id
+VOICEKIRANA_API_TOKEN=your-backend-api-token
 
-Create a local `.env` file in the project root and configure the required values:
+DATABASE_URL=
 
+JWT_SECRET_KEY=your-generated-secret-at-least-32-characters
+VOICEKIRANA_ADMIN_TOKEN=your-admin-token
+```
 
+When `DATABASE_URL` is empty, the backend uses its configured SQLite database.
+
+When `DATABASE_URL` contains a PostgreSQL connection URL, the backend connects to PostgreSQL.
+
+The backend uses `DATABASE_URL` to select its active database. Test database URLs must be selected explicitly by test scripts; the application does not automatically switch to `VOICEKIRANA_TEST_DATABASE_URL`.
+
+Never commit `.env`, database passwords, or API credentials to GitHub.
+
+## Running VoiceKirana
+
+### 1. Start the FastAPI backend
+
+Open the first PowerShell terminal:
+
+```powershell
+cd C:\Users\DELL\Documents\VoiceKirana
+.\venv\Scripts\Activate.ps1
+
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+```
+
+Verify backend health:
 
 ```text
-
-BACKEND\_URL=http://127.0.0.1:8000
-
-APP\_NAME=VoiceKirana
-
-GNANI\_API\_KEY\_ID=your\_gnani\_api\_key\_id
-
-VOICEKIRANA\_API\_TOKEN=your\_backend\_api\_token
-
+http://127.0.0.1:8001/health
 ```
-
-
-
-Replace the placeholders with your own credentials. Do not publish API keys or commit `.env` to version control.
-
-
-
-\## Run the Application
-
-
-
-\### 1. Start the FastAPI backend
-
-
-
-In the first PowerShell terminal:
-
-
-
-```powershell
-
-cd C:\\Users\\DELL\\Documents\\VoiceKirana
-
-.\\.venv\\Scripts\\Activate.ps1
-
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-
-```
-
-
-
-Check backend health at:
-
-
-
-http://127.0.0.1:8000/health
-
-
 
 Expected response:
 
-
-
 ```json
-
 {
-
-&#x20; "status": "ok",
-
-&#x20; "service": "voicekirana-backend"
-
+  "status": "ok",
+  "service": "voicekirana-backend"
 }
-
 ```
 
-
-
-\### 2. Start the Streamlit frontend
-
-
+### 2. Start the Streamlit frontend
 
 Open a second PowerShell terminal:
 
-
-
 ```powershell
-
-cd C:\\Users\\DELL\\Documents\\VoiceKirana
-
-.\\.venv\\Scripts\\Activate.ps1
+cd C:\Users\DELL\Documents\VoiceKirana
+.\venv\Scripts\Activate.ps1
 
 python -m streamlit run frontend/app.py
-
 ```
 
+Open the local Streamlit URL shown in the terminal, normally:
 
-
-Open the local URL printed by Streamlit, normally:
-
-
-
+```text
 http://localhost:8501
-
-
-
-Keep both terminals running while using the application.
-
-
-
-\## Demo Walkthrough
-
-
-
-The current test catalogue includes \*\*Smoke Test Shop (ID 189)\*\* with Rice priced at ₹65 per kg and 20 kg of stock.
-
-
-
-\### Test 1: Available product
-
-
-
-\- Shop ID: `189`
-
-\- Product: `Rice`
-
-\- Quantity: `2`
-
-\- Unit: `kg`
-
-
-
-Expected: Rice is matched, sufficient stock is reported, the estimated total is ₹130, and generated audio can be played.
-
-
-
-\### Test 2: Unknown product
-
-
-
-\- Shop ID: `189`
-
-\- Product: `Dragon Fruit`
-
-\- Quantity: `1`
-
-\- Unit: `kg`
-
-
-
-Expected: The product is reported as unavailable in the catalogue, with no misleading final total.
-
-
-
-\### Test 3: Insufficient stock
-
-
-
-\- Shop ID: `189`
-
-\- Product: `Rice`
-
-\- Quantity: `25`
-
-\- Unit: `kg`
-
-
-
-Expected: The application reports insufficient stock because only 20 kg is available. It must not report the request as successfully fulfilled.
-
-
-
-For inventory checks, the application must clearly state that no stock has been reserved and no order has been placed.
-
-
-
-\## Automated Tests
-
-
-
-The latest recorded test run completed with:
-
-
-
-\- \*\*47 tests passed\*\*
-
-\- \*\*96% overall statement coverage\*\*
-
-\- \*\*100% statement coverage\*\* for the inventory service and Timbre TTS service
-
-
-
-Two dependency deprecation warnings were reported during that run. These did not cause the tests to fail.
-
-
-
-Run the test suite from the project root:
-
-
-
-```powershell
-
-python -m pytest
-
 ```
 
+Keep both services running while using the application.
 
+## Main API Endpoints
 
-To generate a coverage report, if `pytest-cov` is installed:
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Backend health |
+| POST | `/orders/preview` | Validate an order request |
+| POST | `/inventory/check?shop_id={id}` | Check shop inventory |
+| POST | `/orders/confirm?shop_id={id}` | Save a pending order |
+| POST | `/orders/confirm/gnani?shop_id={id}` | Accept Gnani order payload |
+| GET | `/orders/history?shop_id={id}` | Retrieve shop order history |
+| GET | `/orders/{order_reference}?shop_id={id}` | Retrieve an individual order |
+| POST | `/orders/{order_reference}/cancel?shop_id={id}` | Cancel a pending order |
+| POST | `/auth/login` | Shop-owner login |
+| GET | `/auth/me` | Retrieve authenticated profile |
+| POST | `/admin/shops` | Register a shop |
+| POST | `/admin/shops/owners` | Create a shop-owner account |
 
+Protected API routes require the appropriate authentication header or Bearer token.
 
+Order confirmation supports an optional `Idempotency-Key` header to prevent duplicate order creation during retries.
 
-```powershell
+Interactive API documentation is available at:
 
-python -m pytest --cov=backend --cov-report=term-missing
-
+```text
+http://127.0.0.1:8001/docs
 ```
 
+## Order Workflow
 
+1. Customer enters grocery items.
+2. Backend validates the request.
+3. Backend checks the selected shop's inventory.
+4. Frontend displays matching products, availability, and estimated prices.
+5. Customer explicitly confirms the order.
+6. Backend performs a fresh inventory check.
+7. Backend saves the pending order and its items transactionally.
+8. Customer can retrieve order history or look up an order.
+9. A pending order can be cancelled.
 
-\## Security Notes
+Order confirmation does not reserve stock. Shop acceptance and payment must be handled separately.
 
+## Automated Testing
 
+Run the complete test suite:
 
-\- Keep `.env` and API credentials out of source control.
+```powershell
+python -m pytest -q
+```
 
-\- Use environment variables or your deployment platform's secrets manager.
+The latest local regression run completed with **115 tests passed** on November 5, 2026.
 
-\- Do not expose the backend API token in screenshots, public logs, or documentation.
+Additional PostgreSQL runtime verification has passed for:
 
-\- The current inventory workflow is a preview/check flow, not a production order-placement or stock-reservation system.
+- Order creation and persistence.
+- Idempotent retries.
+- Same-key requests with different order data.
+- Concurrent duplicate-request prevention.
+- Transaction rollback.
+- Order history and individual order retrieval.
+- Order cancellation and cancellation edge cases.
+- Cross-shop data isolation.
+- API authentication.
+- Database schema and referential integrity.
 
+The automated test suite and the separate PostgreSQL runtime checks are complementary verification results.
 
+## Current Implementation Status
 
-\## Current Status
+Implemented and tested:
+- Multilingual grocery order data model.
+- Inventory checking and product matching.
+- FastAPI order management.
+- PostgreSQL and SQLite database support.
+- Idempotent order confirmation.
+- Concurrent duplicate prevention.
+- Order retrieval, history, and cancellation.
+- Shop-owner authentication foundation.
+- Gnani Timbre speech generation.
+- Streamlit grocery interface.
 
+Planned enhancements:
+- Customer account management.
+- Online payment integration.
+- WhatsApp order notifications.
+- Delivery status and location tracking.
+- Complete end-to-end Gnani Agent integration.
 
+These planned enhancements are not yet claimed as production-ready features.
 
-The main demo flow has been validated locally, including inventory success, unknown-product handling, insufficient-stock handling, and generated speech playback.
+## Security Notes
 
+- Keep `.env` outside version control.
+- Use strong, unique authentication secrets.
+- Never expose API keys or database passwords in logs or screenshots.
+- Use a dedicated test database for destructive or failure-injection tests.
+- Verify payment signatures server-side when payment processing is integrated.
+- Enforce customer and shop authorization before exposing private order data.
 
+## Future Development
 
-\## Future Improvements
-
-
-
-\- Improve multilingual voice input and recognition.
-
-\- Expand product catalogue and alias coverage.
-
-\- Add further end-to-end tests.
-
-\- Prepare deployment configuration and a recorded demo.
-
-\- Integrate real order placement and stock reservation only when the required workflows are implemented and tested.
-
-
-
->>>>>>> b93a812 (These are the edited files)
+VoiceKirana is being developed toward a complete multilingual grocery commerce experience, including customer accounts, secure payments, messaging notifications, and delivery tracking.
