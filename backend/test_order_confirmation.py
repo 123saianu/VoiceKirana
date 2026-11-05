@@ -1,5 +1,10 @@
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+import pytest
 
 import backend.database as database
 import backend.main as main
@@ -233,3 +238,292 @@ def test_gnani_adapter_rejects_insufficient_stock(
 
     assert response.status_code == 409
     assert get_order_count() == 0
+
+
+def get_idempotency_count():
+    """Count idempotency records in the isolated test database."""
+    from contextlib import closing
+
+    with closing(database.get_connection()) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS total FROM order_idempotency"
+        ).fetchone()
+
+    return row["total"]
+
+
+def test_same_idempotency_key_returns_original_order(
+    tmp_path, monkeypatch
+):
+    """Retrying the same confirmation must not create another order."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "retry-test-001",
+    }
+
+    first = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(),
+    )
+
+    second = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    assert first.json() == second.json()
+    assert first.json()["order_reference"] == second.json()["order_reference"]
+
+    assert get_order_count() == 1
+    assert get_idempotency_count() == 1
+
+
+def test_same_idempotency_key_rejects_different_order(
+    tmp_path, monkeypatch
+):
+    """A key cannot be reused with different order contents."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "retry-test-002",
+    }
+
+    first = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(quantity=1),
+    )
+
+    second = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(quantity=2),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+
+    assert get_order_count() == 1
+    assert get_idempotency_count() == 1
+
+
+def test_new_idempotency_key_allows_legitimate_repeat_order(
+    tmp_path, monkeypatch
+):
+    """A new confirmation key permits an identical legitimate purchase."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    first_headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "new-purchase-001",
+    }
+
+    second_headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "new-purchase-002",
+    }
+
+    first = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=first_headers,
+        json=make_order_payload(),
+    )
+
+    second = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=second_headers,
+        json=make_order_payload(),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    assert first.json()["order_reference"] != second.json()["order_reference"]
+
+    assert get_order_count() == 2
+    assert get_idempotency_count() == 2
+
+
+def test_concurrent_same_key_creates_only_one_order(
+    tmp_path, monkeypatch
+):
+    """
+    Two simultaneous requests with the same idempotency key
+    must create only one database order.
+    """
+
+    client, shop_id = setup_test_environment(
+        tmp_path,
+        monkeypatch,
+    )
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "concurrent-confirmation-001",
+    }
+
+    payload = make_order_payload()
+
+    barrier = Barrier(2)
+
+    def submit_confirmation():
+        # Ensure both requests begin together.
+        barrier.wait(timeout=10)
+
+        # Each thread gets its own TestClient.
+        with TestClient(main.app) as test_client:
+            return test_client.post(
+                f"/orders/confirm/gnani?shop_id={shop_id}",
+                headers=headers,
+                json=payload,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(submit_confirmation),
+            executor.submit(submit_confirmation),
+        ]
+
+        responses = [
+            future.result(timeout=30)
+            for future in futures
+        ]
+
+    # Both requests should receive successful responses.
+    assert all(
+        response.status_code == 200
+        for response in responses
+    )
+
+    first_result = responses[0].json()
+    second_result = responses[1].json()
+
+    # Both callers must receive exactly the same order.
+    assert first_result == second_result
+
+    assert (
+        first_result["order_reference"]
+        == second_result["order_reference"]
+    )
+
+    # Only one order and one idempotency record may exist.
+    assert get_order_count() == 1
+    assert get_idempotency_count() == 1
+
+
+def test_missing_idempotency_key_preserves_legacy_behavior(
+    tmp_path, monkeypatch
+):
+    """Requests without a key should retain backward compatibility."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    response = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers={"X-API-Key": TEST_TOKEN},
+        json=make_order_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+
+    assert get_order_count() == 1
+    assert get_idempotency_count() == 0
+
+
+def test_empty_idempotency_key_is_rejected(
+    tmp_path, monkeypatch
+):
+    """An empty confirmation key must be rejected."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "",
+    }
+
+    response = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(),
+    )
+
+    assert response.status_code == 400
+    assert get_order_count() == 0
+    assert get_idempotency_count() == 0
+
+
+def test_oversized_idempotency_key_is_rejected(
+    tmp_path, monkeypatch
+):
+    """Keys exceeding 200 characters must be rejected."""
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "K" * 201,
+    }
+
+    response = client.post(
+        f"/orders/confirm/gnani?shop_id={shop_id}",
+        headers=headers,
+        json=make_order_payload(),
+    )
+
+    assert response.status_code == 400
+    assert get_order_count() == 0
+    assert get_idempotency_count() == 0
+
+
+def test_failed_order_insert_rolls_back_everything(
+    tmp_path, monkeypatch
+):
+    """
+    Simulate a database failure during order-item insertion.
+
+    Both the order and idempotency record must roll back.
+    """
+
+    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
+
+    # Simulate a database failure when inserting an order item.
+    with database.get_connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_test_order_item_insert
+            BEFORE INSERT ON order_items
+            BEGIN
+                SELECT RAISE(ABORT, 'forced test failure');
+            END;
+            """
+        )
+
+    headers = {
+        "X-API-Key": TEST_TOKEN,
+        "Idempotency-Key": "rollback-test-001",
+    }
+
+    # TestClient propagates the simulated database exception.
+    with pytest.raises(sqlite3.IntegrityError):
+        client.post(
+            f"/orders/confirm/gnani?shop_id={shop_id}",
+            headers=headers,
+            json=make_order_payload(),
+        )
+
+    # Neither the order nor its idempotency record may remain.
+    assert get_order_count() == 0
+    assert get_idempotency_count() == 0

@@ -1,4 +1,4 @@
-
+import hashlib
 import json
 import os
 import secrets
@@ -428,41 +428,72 @@ async def check_inventory(
 from contextlib import closing
 
 
-@app.post("/orders/confirm")
-def confirm_order(
-    order: GroceryOrder,
-    shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
-):
-    """
-    Save an order only after a fresh successful inventory check.
+def _order_request_fingerprint(order: GroceryOrder) -> str:
+    """Create a stable SHA-256 fingerprint of the complete grocery order."""
 
-    Saving the order does not reserve stock or guarantee shop acceptance.
-    """
-    authenticate_api_key(api_key)
-
-    if order.intent != "place_order":
-        raise HTTPException(
-            status_code=400,
-            detail="Only new grocery orders can be confirmed here.",
-        )
-
-    inventory_result = _check_inventory_for_order(
-        order=order,
-        shop_id=shop_id,
+    canonical_order = json.dumps(
+        order.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
 
-    if inventory_result["status"] != "inventory_checked":
+    return hashlib.sha256(
+        canonical_order.encode("utf-8")
+    ).hexdigest()
+
+
+def _get_idempotent_response(
+    shop_id: int,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> dict | None:
+    """Return the original response when this confirmation was processed."""
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT request_fingerprint, response_json
+            FROM order_idempotency
+            WHERE shop_id = ? AND idempotency_key = ?
+            """,
+            (shop_id, idempotency_key),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    if row["request_fingerprint"] != request_fingerprint:
         raise HTTPException(
             status_code=409,
-            detail={
-                "message": (
-                    "The order was not saved because some items "
-                    "need attention or inventory could not be confirmed."
-                ),
-                "inventory_result": inventory_result,
-            },
+            detail="This Idempotency-Key was already used with different order data.",
         )
+
+    if not row["response_json"]:
+        raise HTTPException(
+            status_code=409,
+            detail="This confirmation is still being processed. Check its status before retrying.",
+        )
+
+    try:
+        return json.loads(row["response_json"])
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The stored confirmation response could not be read.",
+        ) from exc
+
+
+def _save_confirmed_order(
+    shop_id: int,
+    inventory_result: dict,
+    idempotency_key: str | None = None,
+    request_fingerprint: str | None = None,
+) -> dict:
+    """
+    Save the order and, when supplied, its idempotency record
+    inside one database transaction.
+    """
 
     order_reference = f"VK-{secrets.token_hex(6).upper()}"
     total_paise = inventory_result["total_paise"]
@@ -470,6 +501,67 @@ def confirm_order(
 
     with closing(get_connection()) as connection:
         with connection:
+
+            # Claim the confirmation key inside the same transaction
+            # that will create the order.
+            if idempotency_key is not None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO order_idempotency (
+                        shop_id,
+                        idempotency_key,
+                        request_fingerprint,
+                        order_id,
+                        response_json
+                    )
+                    VALUES (?, ?, ?, NULL, NULL)
+                    ON CONFLICT (shop_id, idempotency_key) DO NOTHING
+                    """,
+                    (
+                        shop_id,
+                        idempotency_key,
+                        request_fingerprint,
+                    ),
+                )
+
+                # Another request already claimed this key.
+                if cursor.rowcount == 0:
+                    existing = connection.execute(
+                        """
+                        SELECT request_fingerprint, response_json
+                        FROM order_idempotency
+                        WHERE shop_id = ? AND idempotency_key = ?
+                        """,
+                        (shop_id, idempotency_key),
+                    ).fetchone()
+
+                    if existing is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="The confirmation key could not be resolved. Please check order status.",
+                        )
+
+                    if existing["request_fingerprint"] != request_fingerprint:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="This Idempotency-Key was already used with different order data.",
+                        )
+
+                    if not existing["response_json"]:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="This confirmation is still being processed. Check its status before retrying.",
+                        )
+
+                    try:
+                        return json.loads(existing["response_json"])
+                    except json.JSONDecodeError as exc:
+                        raise HTTPException(
+                            status_code=500,
+                            detail="The stored confirmation response could not be read.",
+                        ) from exc
+
+            # Create the actual grocery order.
             order_id = connection.insert_returning_id(
                 """
                 INSERT INTO orders (
@@ -483,6 +575,7 @@ def confirm_order(
                 (order_reference, shop_id, total_paise),
             )
 
+            # Save all verified order items.
             for item in checked_items:
                 connection.execute(
                     """
@@ -506,22 +599,118 @@ def confirm_order(
                     ),
                 )
 
-    return {
-        "status": "pending",
-        "message": (
-            "The order request has been saved. "
-            "Shop acceptance is not yet confirmed, and stock "
-            "has not been reserved."
-        ),
-        "order_id": order_id,
-        "order_reference": order_reference,
-        "shop_id": shop_id,
-        "shop_name": inventory_result["shop_name"],
-        "total_paise": total_paise,
-        "total_rupees": round(total_paise / 100, 2),
-        "items": checked_items,
-        "stock_reserved": False,
-    }
+            response = {
+                "status": "pending",
+                "message": (
+                    "The order request has been saved. "
+                    "Shop acceptance is not yet confirmed, and stock "
+                    "has not been reserved."
+                ),
+                "order_id": order_id,
+                "order_reference": order_reference,
+                "shop_id": shop_id,
+                "shop_name": inventory_result["shop_name"],
+                "total_paise": total_paise,
+                "total_rupees": round(total_paise / 100, 2),
+                "items": checked_items,
+                "stock_reserved": False,
+            }
+
+            # Store the original response before committing.
+            if idempotency_key is not None:
+                connection.execute(
+                    """
+                    UPDATE order_idempotency
+                    SET order_id = ?, response_json = ?
+                    WHERE shop_id = ? AND idempotency_key = ?
+                    """,
+                    (
+                        order_id,
+                        json.dumps(
+                            response,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        shop_id,
+                        idempotency_key,
+                    ),
+                )
+
+    return response
+
+
+@app.post("/orders/confirm")
+def confirm_order(
+    order: GroceryOrder,
+    shop_id: int = Query(gt=0),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+):
+    """
+    Save an order only after a fresh successful inventory check.
+
+    Supports idempotent retries when an Idempotency-Key is supplied.
+    Saving does not reserve stock or guarantee shop acceptance.
+    """
+
+    authenticate_api_key(api_key)
+
+    if order.intent != "place_order":
+        raise HTTPException(
+            status_code=400,
+            detail="Only new grocery orders can be confirmed here.",
+        )
+
+    request_fingerprint = None
+
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+
+        if not idempotency_key or len(idempotency_key) > 200:
+            raise HTTPException(
+                status_code=400,
+                detail="Idempotency-Key must contain between 1 and 200 characters.",
+            )
+
+        request_fingerprint = _order_request_fingerprint(order)
+
+        # Check for an already completed confirmation before checking
+        # inventory again. This preserves the original result on retries.
+        existing_response = _get_idempotent_response(
+            shop_id=shop_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+        )
+
+        if existing_response is not None:
+            return existing_response
+
+    inventory_result = _check_inventory_for_order(
+        order=order,
+        shop_id=shop_id,
+    )
+
+    if inventory_result["status"] != "inventory_checked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "The order was not saved because some items "
+                    "need attention or inventory could not be confirmed."
+                ),
+                "inventory_result": inventory_result,
+            },
+        )
+
+    return _save_confirmed_order(
+        shop_id=shop_id,
+        inventory_result=inventory_result,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+    )
 
 
 @app.post("/orders/confirm/gnani")
@@ -529,13 +718,18 @@ def confirm_order_from_gnani(
     payload: dict = Body(...),
     shop_id: int = Query(gt=0),
     api_key: str | None = Header(default=None, alias="X-API-Key"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
 ):
     """
-    Accept a Gnani JSON-string wrapper, validate the grocery order,
-    and pass it to the existing order-confirmation logic.
+    Accept Gnani's JSON-string wrapper and pass the validated
+    grocery order to the existing confirmation logic.
     """
 
-    # Extract the JSON string generated by Gnani.
+    authenticate_api_key(api_key)
+
     order_request = payload.get("order_request")
 
     if not isinstance(order_request, str):
@@ -544,7 +738,6 @@ def confirm_order_from_gnani(
             detail="order_request must be a JSON string.",
         )
 
-    # Convert the JSON string into a validated GroceryOrder.
     try:
         order = GroceryOrder.model_validate_json(order_request)
 
@@ -554,13 +747,11 @@ def confirm_order_from_gnani(
             detail=f"Invalid grocery order JSON: {exc}",
         ) from exc
 
-    # Reuse the existing confirmation function.
-    # It handles authentication, inventory validation,
-    # database insertion and the response.
     return confirm_order(
         order=order,
         shop_id=shop_id,
         api_key=api_key,
+        idempotency_key=idempotency_key,
     )
 
 
