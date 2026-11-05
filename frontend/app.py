@@ -1,5 +1,6 @@
 
 import os
+import uuid
 
 import requests
 import streamlit as st
@@ -154,7 +155,7 @@ st.caption(
 
 backend_url = os.getenv(
     "BACKEND_URL",
-    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
 ).rstrip("/")
 
 api_token = os.getenv("VOICEKIRANA_API_TOKEN")
@@ -178,6 +179,9 @@ if "pending_order_payload" not in st.session_state:
 
 if "pending_shop_id" not in st.session_state:
     st.session_state.pending_shop_id = None
+
+if "pending_idempotency_key" not in st.session_state:
+    st.session_state.pending_idempotency_key = None
 
 if "saved_order_result" not in st.session_state:
     st.session_state.saved_order_result = None
@@ -207,9 +211,9 @@ st.divider()
 st.subheader("🛒 Grocery order")
 
 st.info(
-    "Current test data: Smoke Test Shop (ID 203). "
-    "Rice is the only inventory item currently registered. "
-    "Other products may require clarification or may not be in stock."
+    "Enter an active shop ID from the database connected to "
+    "the backend. Shop IDs may differ between database environments. "
+    "Product availability depends on the selected shop's inventory."
 )
 
 shop_id = st.number_input(
@@ -218,6 +222,10 @@ shop_id = st.number_input(
     value=6,
     step=1,
     key="shop_id",
+    help=(
+        "Enter the ID of an active shop in the database "
+        "currently connected to the backend."
+    ),
 )
 
 language = st.selectbox(
@@ -301,6 +309,7 @@ if submitted:
     # A new validation attempt invalidates any older confirmation preview.
     st.session_state.pending_order_payload = None
     st.session_state.pending_shop_id = None
+    st.session_state.pending_idempotency_key = None
     st.session_state.saved_order_result = None
 
     if not api_token:
@@ -505,9 +514,13 @@ if submitted:
         if result.get("status") == "inventory_checked":
             st.session_state.pending_order_payload = order_payload
             st.session_state.pending_shop_id = int(shop_id)
+
+            # Generate one key for this confirmed order request.
+            st.session_state.pending_idempotency_key = uuid.uuid4().hex
         else:
             st.session_state.pending_order_payload = None
             st.session_state.pending_shop_id = None
+            st.session_state.pending_idempotency_key = None
 
         message = result.get(
             "message",
@@ -660,7 +673,10 @@ if pending_payload and pending_shop_id:
                         f"{backend_url}/orders/confirm",
                         params={"shop_id": pending_shop_id},
                         json=pending_payload,
-                        headers={"X-API-Key": api_token},
+                        headers={
+                            "X-API-Key": api_token,
+                            "Idempotency-Key": st.session_state.pending_idempotency_key,
+                        },
                         timeout=20,
                     )
 
@@ -668,6 +684,7 @@ if pending_payload and pending_shop_id:
                     st.session_state.saved_order_result = confirm_response.json()
                     st.session_state.pending_order_payload = None
                     st.session_state.pending_shop_id = None
+                    st.session_state.pending_idempotency_key = None
                     st.rerun()
                 else:
                     try:
