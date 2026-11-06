@@ -2,6 +2,12 @@ import hashlib
 import json
 import os
 import secrets
+from fastapi.responses import Response
+from backend.services.twilio_whatsapp_service import (
+    TwilioConfigurationError,
+    build_whatsapp_reply,
+    validate_twilio_webhook,
+)
 from backend.models.payment import (
     RazorpayPaymentVerificationRequest,
 )
@@ -2326,6 +2332,67 @@ async def handle_razorpay_webhook(request: Request):
         "payment_status": final_payment_status,
     }
 
+
+@app.post("/webhooks/twilio/whatsapp")
+async def receive_twilio_whatsapp_message(request: Request):
+    """
+    Receive WhatsApp messages through Twilio Sandbox.
+
+    Validate the Twilio signature before processing the message.
+    Return TwiML so Twilio can send an automatic WhatsApp reply.
+    """
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Twilio webhook form data.",
+        ) from exc
+
+    # Include all form parameters in signature verification.
+    parameters = dict(form)
+
+    try:
+        signature_valid = validate_twilio_webhook(
+            signature,
+            parameters,
+        )
+    except TwilioConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio webhook configuration is unavailable.",
+        ) from exc
+
+    if not signature_valid:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid Twilio webhook signature.",
+        )
+
+    sender = parameters.get("From", "")
+    message_body = parameters.get("Body", "")
+
+    if not sender.startswith("whatsapp:"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid WhatsApp sender address.",
+        )
+
+    if len(message_body) > 1600:
+        raise HTTPException(
+            status_code=413,
+            detail="Incoming WhatsApp message is too long.",
+        )
+
+    twiml = build_whatsapp_reply(message_body)
+
+    return Response(
+        content=twiml,
+        media_type="application/xml",
+    )
 
 # ============================================================
 # SHOP CATALOGUE MANAGEMENT

@@ -11,3 +11,5 @@ httpx
 # Authentication and security
 pwdlib[argon2]>=0.2,<1
 PyJWT>=2.10,<3
+twilio==9.11.2
+python-multipart==0.0.33
