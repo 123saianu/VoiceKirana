@@ -1,4 +1,3 @@
-from contextlib import closing
 
 from backend.database import get_connection
 
@@ -39,7 +38,7 @@ def register_product_for_shop(shop_id: int, payload) -> dict:
     normalized_brand = _normalize_optional(payload.brand)
     normalized_variant = _normalize_optional(payload.variant)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             shop = _get_active_shop(connection, shop_id)
 
@@ -177,7 +176,7 @@ def register_product_for_shop(shop_id: int, payload) -> dict:
 def get_shop_inventory(shop_id: int) -> list[dict]:
     """Return all products and inventory details for an active shop."""
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         shop = _get_active_shop(connection, shop_id)
 
         if shop is None:
@@ -246,7 +245,7 @@ def update_shop_inventory(
 
     parameters.extend([shop_id, product_id])
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             shop = _get_active_shop(connection, shop_id)
 
@@ -313,7 +312,7 @@ def add_shop_product_alias(
     if not normalized_alias:
         raise ValueError("Product alias cannot be empty.")
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             shop = _get_active_shop(connection, shop_id)
 

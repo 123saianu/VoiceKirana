@@ -141,7 +141,7 @@ async def preview_order(
     except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid order request: {exc}",
+            detail="Invalid order request. Please check the submitted order details.",
         ) from exc
 
     order_data = order.model_dump()
@@ -440,7 +440,7 @@ async def check_inventory(
     except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid inventory request: {exc}",
+            detail="Invalid inventory request. Please check the submitted product and quantity details.",
         ) from exc
 
     return _check_inventory_for_order(
@@ -448,8 +448,6 @@ async def check_inventory(
         shop_id=shop_id,
     )
 
-
-from contextlib import closing
 
 
 def _order_request_fingerprint(order: GroceryOrder) -> str:
@@ -474,7 +472,7 @@ def _get_idempotent_response(
 ) -> dict | None:
     """Return the original response when this confirmation was processed."""
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         row = connection.execute(
             """
             SELECT request_fingerprint, response_json
@@ -524,7 +522,7 @@ def _save_confirmed_order(
     total_paise = inventory_result["total_paise"]
     checked_items = inventory_result["items"]
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
 
             # Claim the confirmation key inside the same transaction
@@ -780,7 +778,7 @@ def confirm_order_from_gnani(
     except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid grocery order JSON: {exc}",
+            detail="Invalid grocery order JSON. Please check the submitted fields and data types.",
         ) from exc
 
     return confirm_order(
@@ -794,12 +792,13 @@ def confirm_order_from_gnani(
 @app.get("/orders/history")
 def order_history(
     shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
+    shop_access: dict = Depends(
+        require_shop_access("owner", "manager")
+    )
 ):
     """Return saved orders and their items for one shop."""
-    authenticate_api_key(api_key)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         shop = connection.execute(
             "SELECT id, name FROM shops WHERE id = ? AND is_active = 1",
             (shop_id,),
@@ -928,12 +927,13 @@ def _load_order_details(connection, order_row):
 def get_order(
     order_reference: str,
     shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
+    shop_access: dict = Depends(
+        require_shop_access("owner", "manager")
+    ),
 ):
     """Retrieve one saved order by reference, scoped to its shop."""
-    authenticate_api_key(api_key)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         shop = connection.execute(
             "SELECT id FROM shops WHERE id = ? AND is_active = 1",
             (shop_id,),
@@ -960,12 +960,13 @@ def get_order(
 def cancel_order(
     order_reference: str,
     shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
+    shop_access: dict = Depends(
+        require_shop_access("owner", "manager")
+    ),
 ):
     """Cancel a pending order and persist the status change."""
-    authenticate_api_key(api_key)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         shop = connection.execute(
             "SELECT id FROM shops WHERE id = ? AND is_active = 1",
             (shop_id,),
@@ -1039,7 +1040,7 @@ def admin_create_shop(
 
     authenticate_admin_token(admin_token)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             shop_id = connection.insert_returning_id(
                 """
@@ -1079,7 +1080,7 @@ def admin_create_shop_owner(
     # Perform password hashing before opening the database transaction.
     password_hash = hash_password(payload.password)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             shop = connection.execute(
                 """
@@ -1159,7 +1160,7 @@ def admin_create_shop_owner(
 def shop_owner_login(payload: LoginRequest):
     """Authenticate a shop owner and issue a signed JWT."""
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         user = connection.execute(
             """
             SELECT
@@ -1220,7 +1221,7 @@ def register_customer(payload: CustomerRegisterRequest):
 
     password_hash = hash_password(payload.password)
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             cursor = connection.execute(
                 """
@@ -1265,7 +1266,7 @@ def register_customer(payload: CustomerRegisterRequest):
 def customer_login(payload: LoginRequest):
     """Authenticate a customer and issue a customer-specific JWT."""
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         customer = connection.execute(
             """
             SELECT
@@ -1417,7 +1418,7 @@ def get_customer_order_history(
 
     customer_id = current_customer["customer_id"]
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         order_rows = connection.execute(
             """
             SELECT
@@ -1459,7 +1460,7 @@ def get_customer_order(
 
     customer_id = current_customer["customer_id"]
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         order_row = connection.execute(
             """
             SELECT
@@ -1525,7 +1526,7 @@ def create_customer_payment(
         ) from exc
 
     # Only retrieve an order owned by this authenticated customer.
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         order = connection.execute(
             """
             SELECT
@@ -1633,7 +1634,7 @@ def create_customer_payment(
 
     # Claim the payment attempt in the database before calling Razorpay.
     try:
-        with closing(get_connection()) as connection:
+        with get_connection() as connection:
             with connection:
                 payment_id = connection.insert_returning_id(
                     """
@@ -1658,7 +1659,7 @@ def create_customer_payment(
     except Exception as exc:
         # The database's partial unique index prevents concurrent
         # active attempts for the same order.
-        with closing(get_connection()) as connection:
+        with get_connection() as connection:
             active = connection.execute(
                 """
                 SELECT id, status
@@ -1705,7 +1706,7 @@ def create_customer_payment(
             exc.status_code is not None
             and 400 <= exc.status_code < 500
         ):
-            with closing(get_connection()) as connection:
+            with get_connection() as connection:
                 with connection:
                     connection.execute(
                         """
@@ -1728,7 +1729,7 @@ def create_customer_payment(
             ),
         ) from exc
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             connection.execute(
                 """
@@ -1776,7 +1777,7 @@ def verify_customer_payment(
 
     # Retrieve the payment using the authenticated customer's
     # ownership and the payment's server-stored Razorpay order ID.
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         payment = connection.execute(
             """
             SELECT
@@ -1937,7 +1938,7 @@ def verify_customer_payment(
 
     # Never downgrade a captured/refunded payment if a delayed
     # verification request races with another status update.
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             connection.execute(
                 """
@@ -2188,7 +2189,7 @@ async def handle_razorpay_webhook(request: Request):
     final_payment_status = None
 
     # Store the event and update the payment in one transaction.
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         with connection:
             insert_result = connection.execute(
                 """

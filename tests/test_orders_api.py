@@ -1,7 +1,7 @@
-
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.security import create_access_token
 import backend.main as main
 import backend.database as database
 from backend.database import get_connection, initialize_database
@@ -12,6 +12,9 @@ from backend.services.inventory_service import (
 )
 
 TEST_API_TOKEN = "voicekirana-test-token"
+TEST_JWT_SECRET = (
+    "test-jwt-secret-for-voicekirana-orders-at-least-32-characters"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +26,7 @@ def isolate_orders_api_database(monkeypatch, tmp_path):
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "DATABASE_PATH", test_db_path)
     monkeypatch.setattr(main, "VOICEKIRANA_API_TOKEN", TEST_API_TOKEN)
+    monkeypatch.setenv("JWT_SECRET_KEY", TEST_JWT_SECRET)
 
     initialize_database()
 
@@ -31,6 +35,43 @@ def isolate_orders_api_database(monkeypatch, tmp_path):
 def client():
     """Create a test client using the isolated database."""
     return TestClient(main.app)
+
+
+def create_shop_owner_headers(shop_id, role="owner"):
+    """Create a test shop member and return its Bearer JWT header."""
+    email = f"orders-test-{shop_id}-{role}@example.com"
+
+    with get_connection() as connection:
+        user_id = connection.insert_returning_id(
+            """
+            INSERT INTO users (
+                email,
+                full_name,
+                password_hash
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                email,
+                "Orders API Test User",
+                "unused-test-password-hash",
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO shop_memberships (
+                user_id,
+                shop_id,
+                role
+            )
+            VALUES (?, ?, ?)
+            """,
+            (user_id, shop_id, role),
+        )
+
+    token = create_access_token(user_id)
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_health_endpoint(client):
@@ -344,9 +385,11 @@ def test_confirm_order_saves_order_and_items(client):
     assert data["stock_reserved"] is False
     assert len(data["items"]) == 1
 
+    shop_headers = create_shop_owner_headers(shop_id)
+
     history_response = client.get(
         f"/orders/history?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
     assert history_response.status_code == 200
@@ -397,9 +440,29 @@ def test_confirm_order_rejects_unmatched_product(client):
 
 
 def test_order_history_requires_authentication(client):
-    response = client.get("/orders/history?shop_id=1")
+    response = client.get(
+        "/orders/history?shop_id=1",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
 
     assert response.status_code == 401
+
+
+def test_manager_can_access_assigned_shop_order_history(client):
+    shop_id = create_shop("Manager Order History Test Shop")
+    manager_headers = create_shop_owner_headers(
+        shop_id,
+        role="manager",
+    )
+
+    response = client.get(
+        f"/orders/history?shop_id={shop_id}",
+        headers=manager_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["shop_id"] == shop_id
+    assert response.json()["count"] == 0
 
 
 def _create_pending_rice_order(client, shop_name="Day 8 Order Test Shop"):
@@ -430,15 +493,18 @@ def _create_pending_rice_order(client, shop_name="Day 8 Order Test Shop"):
         headers={"X-API-Key": TEST_API_TOKEN},
     )
     assert response.status_code == 200
-    return shop_id, response.json()
+    shop_headers = create_shop_owner_headers(shop_id)
+    return shop_id, response.json(), shop_headers
 
 
 def test_get_order_by_reference_returns_saved_order(client):
-    shop_id, saved = _create_pending_rice_order(client, "Day 8 Lookup Shop")
+    shop_id, saved, shop_headers = _create_pending_rice_order(
+        client, "Day 8 Lookup Shop"
+    )
 
     response = client.get(
         f"/orders/{saved['order_reference']}?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
     assert response.status_code == 200
@@ -454,9 +520,10 @@ def test_get_order_by_unknown_reference_returns_404(client):
     initialize_database()
     shop_id = create_shop("Day 8 Unknown Order Shop")
 
+    shop_headers = create_shop_owner_headers(shop_id)
     response = client.get(
         f"/orders/VK-DOESNOTEXIST?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
     assert response.status_code == 404
@@ -464,23 +531,49 @@ def test_get_order_by_unknown_reference_returns_404(client):
 
 
 def test_order_lookup_is_scoped_to_shop(client):
-    shop_id, saved = _create_pending_rice_order(client, "Day 8 Private Shop")
+    shop_id, saved, shop_headers = _create_pending_rice_order(
+        client, "Day 8 Private Shop"
+    )
     other_shop_id = create_shop("Day 8 Other Shop")
 
     response = client.get(
         f"/orders/{saved['order_reference']}?shop_id={other_shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 403
+
+
+def test_shop_owner_cannot_cancel_another_shops_order(client):
+    shop_id, saved, shop_headers = _create_pending_rice_order(
+        client, "Day 8 Private Cancellation Shop"
+    )
+    other_shop_id = create_shop("Day 8 Other Cancellation Shop")
+
+    response = client.post(
+        f"/orders/{saved['order_reference']}/cancel?shop_id={other_shop_id}",
+        headers=shop_headers,
+    )
+
+    assert response.status_code == 403
+
+    # The original shop's order must remain pending.
+    lookup = client.get(
+        f"/orders/{saved['order_reference']}?shop_id={shop_id}",
+        headers=shop_headers,
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["status"] == "pending"
 
 
 def test_cancel_pending_order_persists_cancelled_status(client):
-    shop_id, saved = _create_pending_rice_order(client, "Day 8 Cancellation Shop")
+    shop_id, saved, shop_headers = _create_pending_rice_order(
+        client, "Day 8 Cancellation Shop"
+    )
 
     response = client.post(
         f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
     assert response.status_code == 200
@@ -488,23 +581,25 @@ def test_cancel_pending_order_persists_cancelled_status(client):
 
     lookup = client.get(
         f"/orders/{saved['order_reference']}?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
     assert lookup.status_code == 200
     assert lookup.json()["status"] == "cancelled"
 
     history = client.get(
         f"/orders/history?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
     assert history.status_code == 200
     assert history.json()["orders"][0]["status"] == "cancelled"
 
 
 def test_cancelled_order_cannot_be_cancelled_again(client):
-    shop_id, saved = _create_pending_rice_order(client, "Day 8 Repeat Cancel Shop")
+    shop_id, saved, shop_headers = _create_pending_rice_order(
+        client, "Day 8 Repeat Cancel Shop"
+    )
     url = f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}"
-    headers = {"X-API-Key": TEST_API_TOKEN}
+    headers = shop_headers
 
     first = client.post(url, headers=headers)
     second = client.post(url, headers=headers)
@@ -515,13 +610,17 @@ def test_cancelled_order_cannot_be_cancelled_again(client):
 
 
 def test_order_lookup_requires_authentication(client):
-    response = client.get("/orders/VK-ANYREFERENCE?shop_id=1")
+    response = client.get(
+        "/orders/VK-ANYREFERENCE?shop_id=1",
+        headers={"X-API-Key": TEST_API_TOKEN},
+    )
     assert response.status_code == 401
 
 
 def test_order_cancellation_requires_authentication(client):
     response = client.post(
-        "/orders/VK-ANYREFERENCE/cancel?shop_id=1"
+        "/orders/VK-ANYREFERENCE/cancel?shop_id=1",
+        headers={"X-API-Key": TEST_API_TOKEN},
     )
     assert response.status_code == 401
 
@@ -537,42 +636,43 @@ def _deactivate_shop(shop_id):
 
 
 def test_get_order_rejects_inactive_shop(client):
-    shop_id, saved = _create_pending_rice_order(
+    shop_id, saved, shop_headers = _create_pending_rice_order(
         client, "Day 10 Inactive Lookup Shop"
     )
     _deactivate_shop(shop_id)
 
     response = client.get(
         f"/orders/{saved['order_reference']}?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Active shop not found."
+    assert response.status_code == 403
+    assert response.json()["detail"] == "You do not have access to this shop."
 
 
 def test_cancel_order_rejects_inactive_shop(client):
-    shop_id, saved = _create_pending_rice_order(
+    shop_id, saved, shop_headers = _create_pending_rice_order(
         client, "Day 10 Inactive Cancellation Shop"
     )
     _deactivate_shop(shop_id)
 
     response = client.post(
         f"/orders/{saved['order_reference']}/cancel?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Active shop not found."
+    assert response.status_code == 403
+    assert response.json()["detail"] == "You do not have access to this shop."
 
 
 def test_cancelling_unknown_order_returns_404(client):
     initialize_database()
     shop_id = create_shop("Day 10 Missing Cancellation Shop")
 
+    shop_headers = create_shop_owner_headers(shop_id)
     response = client.post(
         f"/orders/VK-DOESNOTEXIST/cancel?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_API_TOKEN},
+        headers=shop_headers,
     )
 
     assert response.status_code == 404
@@ -580,11 +680,11 @@ def test_cancelling_unknown_order_returns_404(client):
 
 
 def test_cancellation_preserves_order_total_and_items(client):
-    shop_id, saved = _create_pending_rice_order(
+    shop_id, saved, shop_headers = _create_pending_rice_order(
         client, "Day 10 Order Integrity Shop"
     )
     reference = saved["order_reference"]
-    headers = {"X-API-Key": TEST_API_TOKEN}
+    headers = shop_headers
 
     before = client.get(
         f"/orders/{reference}?shop_id={shop_id}",

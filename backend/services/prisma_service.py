@@ -1,14 +1,15 @@
-
+import logging
 import os
-import requests
 
+import requests
 from dotenv import load_dotenv
 
-# Load credentials from the project's .env file
+# Load credentials from the project's .env file.
 load_dotenv()
 
-GNANI_API_KEY_ID = os.getenv("GNANI_API_KEY_ID")
+logger = logging.getLogger(__name__)
 
+GNANI_API_KEY_ID = os.getenv("GNANI_API_KEY_ID")
 GNANI_STT_URL = "https://api.vachana.ai/stt/v3"
 
 
@@ -24,7 +25,7 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
         )
 
     if not os.path.isfile(audio_path):
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        raise FileNotFoundError("Audio file not found.")
 
     headers = {
         "X-API-Key-ID": GNANI_API_KEY_ID
@@ -54,25 +55,63 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
 
         response.raise_for_status()
 
-        result = response.json()
+        try:
+            result = response.json()
+        except ValueError:
+            logger.warning(
+                "Gnani STT returned invalid JSON (HTTP %s).",
+                response.status_code
+            )
+            raise RuntimeError(
+                "Gnani returned an invalid response. Please try again."
+            ) from None
 
-        if not result.get("success"):
-            raise RuntimeError(f"Gnani transcription failed: {result}")
+        if not isinstance(result, dict):
+            logger.warning("Gnani STT returned an unexpected response format.")
+            raise RuntimeError(
+                "Gnani returned an invalid response. Please try again."
+            )
 
-        transcript = result.get("transcript", "").strip()
+        if result.get("success") is not True:
+            logger.warning(
+                "Gnani STT reported an unsuccessful transcription (HTTP %s).",
+                response.status_code
+            )
+            raise RuntimeError(
+                "Gnani transcription failed. Please try again."
+            )
 
-        if not transcript:
+        transcript = result.get("transcript")
+
+        if not isinstance(transcript, str) or not transcript.strip():
             raise RuntimeError("Gnani returned an empty transcript.")
 
-        return transcript
+        return transcript.strip()
 
     except requests.exceptions.Timeout:
-        raise RuntimeError("Gnani API request timed out. Please try again.")
+        logger.warning("Gnani STT request timed out.")
+        raise RuntimeError(
+            "Gnani API request timed out. Please try again."
+        ) from None
 
     except requests.exceptions.HTTPError:
-        raise RuntimeError(
-            f"Gnani API error ({response.status_code}): {response.text}"
+        status_code = getattr(response, "status_code", "unknown")
+
+        logger.warning(
+            "Gnani STT HTTP request failed (status=%s).",
+            status_code
         )
 
+        raise RuntimeError(
+            f"Gnani API request failed (HTTP {status_code}). Please try again."
+        ) from None
+
     except requests.exceptions.RequestException as error:
-        raise RuntimeError(f"Could not connect to Gnani: {error}")
+        logger.warning(
+            "Gnani STT connection failed (%s).",
+            type(error).__name__
+        )
+
+        raise RuntimeError(
+            "Could not connect to Gnani. Please try again."
+        ) from None

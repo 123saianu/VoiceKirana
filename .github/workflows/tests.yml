@@ -1,0 +1,62 @@
+name: VoiceKirana CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voicekirana-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Run Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      APP_NAME: VoiceKirana
+      BACKEND_URL: http://127.0.0.1:8001
+
+      # CI-only values. Never use production credentials here.
+      DATABASE_URL: ""
+      VOICEKIRANA_API_TOKEN: ci-only-voicekirana-token
+      JWT_SECRET_KEY: ci-only-jwt-secret-key-not-for-production-123456789
+      VOICEKIRANA_ADMIN_TOKEN: ci-only-admin-token
+      GNANI_API_KEY_ID: ci-only-gnani-key
+
+      RAZORPAY_MODE: test
+      RAZORPAY_KEY_ID: rzp_test_ci_dummy
+      RAZORPAY_KEY_SECRET: ci-only-razorpay-secret
+      RAZORPAY_WEBHOOK_SECRET: ci-only-razorpay-webhook-secret
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile backend and tests
+        run: python -m compileall backend tests
+
+      - name: Run complete test suite
+        run: python -m pytest -q

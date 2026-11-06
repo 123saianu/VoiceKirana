@@ -117,7 +117,7 @@ async def preview_order(
     except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid order request: {exc}",
+            detail="Invalid order request. Please check the submitted order details.",
         ) from exc
 
     order_data = order.model_dump()
@@ -416,7 +416,7 @@ async def check_inventory(
     except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid inventory request: {exc}",
+            detail="Invalid inventory request. Please check the submitted product and quantity details.",
         ) from exc
 
     return _check_inventory_for_order(

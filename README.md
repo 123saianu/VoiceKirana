@@ -31,6 +31,7 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 **Important:** Saving an order does not reserve inventory or guarantee shop acceptance. Payment and delivery are separate workflows.
 
 ### Voice and AI
+- Gnani Prisma speech-to-text integration.
 - Gnani Timbre text-to-speech integration.
 - Spoken responses for inventory results.
 - Integration foundation for multilingual conversational ordering through Gnani AI.
@@ -41,11 +42,13 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 - Argon2 password hashing.
 - JWT-based access tokens.
 - Shop membership and role-based authorization.
+- Customer authentication and order ownership checks.
 - Separate administrator authentication.
 
 ### Database
 - SQLite support for local development.
 - PostgreSQL support for deployment.
+- Managed database connection lifecycle.
 - Database transactions and rollback.
 - Foreign-key and check constraints.
 - PostgreSQL idempotency and concurrency protection.
@@ -64,26 +67,31 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 | HTTP requests | Requests |
 | Testing | Pytest |
 | Configuration | Python-dotenv |
+| CI | GitHub Actions |
 
 ## Project Structure
 
 ```text
 VoiceKirana/
-├── backend/
-│   ├── main.py
-│   ├── database.py
-│   ├── auth_dependencies.py
-│   ├── security.py
-│   ├── models/
-│   ├── services/
-│   └── test_*.py
-├── frontend/
-│   └── app.py
-├── data/
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
+|-- .github/
+|   `-- workflows/
+|       `-- tests.yml
+|-- backend/
+|   |-- main.py
+|   |-- database.py
+|   |-- auth_dependencies.py
+|   |-- security.py
+|   |-- models/
+|   `-- services/
+|-- frontend/
+|   `-- app.py
+|-- tests/
+|-- data/
+|-- logs/
+|-- requirements.txt
+|-- .env.example
+|-- .gitignore
+`-- README.md
 ```
 
 ## Prerequisites
@@ -131,13 +139,18 @@ DATABASE_URL=
 
 JWT_SECRET_KEY=your-generated-secret-at-least-32-characters
 VOICEKIRANA_ADMIN_TOKEN=your-admin-token
+
+RAZORPAY_MODE=test
+RAZORPAY_KEY_ID=your-razorpay-key-id
+RAZORPAY_KEY_SECRET=your-razorpay-key-secret
+RAZORPAY_WEBHOOK_SECRET=your-razorpay-webhook-secret
 ```
 
 When `DATABASE_URL` is empty, the backend uses its configured SQLite database.
 
 When `DATABASE_URL` contains a PostgreSQL connection URL, the backend connects to PostgreSQL.
 
-The backend uses `DATABASE_URL` to select its active database. Test database URLs must be selected explicitly by test scripts; the application does not automatically switch to `VOICEKIRANA_TEST_DATABASE_URL`.
+The backend uses `DATABASE_URL` to select its active database. PostgreSQL integration and verification scripts must explicitly select their intended test database connection.
 
 Never commit `.env`, database passwords, or API credentials to GitHub.
 
@@ -204,8 +217,18 @@ Keep both services running while using the application.
 | GET | `/auth/me` | Retrieve authenticated profile |
 | POST | `/admin/shops` | Register a shop |
 | POST | `/admin/shops/owners` | Create a shop-owner account |
+| POST | `/customers/orders/confirm` | Confirm an authenticated customer's order |
+| GET | `/customers/orders` | Retrieve the authenticated customer's orders |
+| GET | `/customers/orders/{order_reference}` | Retrieve one of the customer's own orders |
 
-Protected API routes require the appropriate authentication header or Bearer token.
+Protected API routes require the appropriate authentication mechanism.
+
+- Shop order-history, retrieval, and cancellation endpoints require a valid shop-member JWT and active membership for the requested shop.
+- Customer order endpoints require customer authentication and restrict access to that customer's orders.
+- Internal service endpoints use the configured server-to-server API token.
+- Administrator operations require administrator authentication.
+
+The shared internal API token must remain server-side and must not be embedded in browser-side code.
 
 Order confirmation supports an optional `Idempotency-Key` header to prevent duplicate order creation during retries.
 
@@ -237,7 +260,7 @@ Run the complete test suite:
 python -m pytest -q
 ```
 
-The latest local regression run completed with **115 tests passed** on November 5, 2026.
+The latest local regression run on **November 7, 2026**, completed with **226 tests passed and 3 warnings**.
 
 Additional PostgreSQL runtime verification has passed for:
 
@@ -254,6 +277,18 @@ Additional PostgreSQL runtime verification has passed for:
 
 The automated test suite and the separate PostgreSQL runtime checks are complementary verification results.
 
+## Continuous Integration
+
+VoiceKirana includes a GitHub Actions workflow at `.github/workflows/tests.yml`.
+
+The workflow runs on pushes to `main`, pull requests targeting `main`, and manual execution.
+
+It uses Ubuntu and Python 3.12, installs dependencies, compiles the backend and tests, and runs the complete Pytest suite.
+
+CI uses dummy test-only environment values. Production credentials must never be used in automated test configuration.
+
+The workflow has been validated locally using CI-style environment variables, with **226 tests passing**. The GitHub-hosted workflow result is pending its first execution after the workflow is pushed to the repository.
+
 ## Current Implementation Status
 
 Implemented and tested:
@@ -264,8 +299,12 @@ Implemented and tested:
 - Idempotent order confirmation.
 - Concurrent duplicate prevention.
 - Order retrieval, history, and cancellation.
-- Shop-owner authentication foundation.
-- Gnani Timbre speech generation.
+- Shop-owner authentication and active shop-membership authorization.
+- Customer authentication and customer-scoped order access.
+- Cross-shop and customer order-data isolation.
+- Managed database connection lifecycle and transaction rollback.
+- Database schema constraints and foreign-key indexes.
+- Gnani Prisma speech-to-text and Timbre speech-generation integrations.
 - Streamlit grocery interface.
 
 Planned enhancements:

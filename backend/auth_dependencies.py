@@ -1,4 +1,3 @@
-from contextlib import closing
 
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -59,7 +58,7 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         user = connection.execute(
             """
             SELECT id, email, full_name, is_active
@@ -133,7 +132,7 @@ def get_current_customer(
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    with closing(get_connection()) as connection:
+    with get_connection() as connection:
         customer = connection.execute(
             """
             SELECT id, email, full_name, is_active

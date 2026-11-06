@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 
 # Load .env before reading database configuration.
 load_dotenv()
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
@@ -26,6 +25,8 @@ class DatabaseConnection:
     def __init__(self, connection, is_postgres: bool):
         self._connection = connection
         self._is_postgres = is_postgres
+        self._closed = False
+        self._context_depth = 0
 
     def execute(self, sql, parameters=()):
         if self._is_postgres:
@@ -52,27 +53,45 @@ class DatabaseConnection:
         return self._connection.executescript(sql)
 
     def __enter__(self):
+        if self._closed:
+            raise RuntimeError("Cannot use a closed database connection.")
+
+        self._context_depth += 1
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._is_postgres:
-            if exc_type is None:
-                self._connection.commit()
-            else:
-                self._connection.rollback()
-
-            # Keep the connection open. It may be used again
-            # after this transaction block.
+        """
+        Finalize the transaction and close the connection only
+        when the outermost context exits.
+        """
+        if self._context_depth == 0:
             return False
+        self._context_depth -= 1
+        if self._context_depth > 0:
+            return False
+        try:
+            if self._is_postgres:
+                if exc_type is None:
+                    self._connection.commit()
+                else:
+                    self._connection.rollback()
+            else:
+                self._connection.__exit__(
+                    exc_type,
+                    exc_value,
+                    traceback,
+                )
+        finally:
+            self.close()
 
-        return self._connection.__exit__(
-            exc_type,
-            exc_value,
-            traceback,
-        )
+        return False
+
 
     def close(self):
-        self._connection.close()
+        """Close the underlying connection exactly once."""
+        if not self._closed:
+            self._closed = True
+            self._connection.close()
 
     @property
     def row_factory(self):
@@ -322,7 +341,14 @@ def initialize_database():
 
     CREATE INDEX IF NOT EXISTS idx_payments_order
         ON payments(order_id);
-
+    CREATE INDEX IF NOT EXISTS idx_inventory_product
+        ON inventory(product_id);
+    CREATE INDEX IF NOT EXISTS idx_order_idempotency_order
+        ON order_idempotency(order_id);
+    CREATE INDEX IF NOT EXISTS idx_order_items_order
+        ON order_items(order_id);
+    CREATE INDEX IF NOT EXISTS idx_order_items_product
+        ON order_items(product_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_one_active_per_order
         ON payments(order_id)
         WHERE status IN (
