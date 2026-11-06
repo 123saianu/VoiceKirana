@@ -271,7 +271,6 @@ Implemented and tested:
 Planned enhancements:
 - Customer account management.
 - Online payment integration.
-- WhatsApp order notifications.
 - Delivery status and location tracking.
 - Complete end-to-end Gnani Agent integration.
 
