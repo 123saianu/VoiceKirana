@@ -1,5 +1,4 @@
 
-import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -55,10 +54,10 @@ def setup_test_environment(tmp_path, monkeypatch, stock_quantity=20):
     return client, shop_id
 
 
-def make_order_payload(raw_name="బియ్యం", quantity=1):
-    """Create the same JSON-string wrapper used by Gnani."""
+def make_order_payload(raw_name="??????", quantity=1):
+    """Create a direct structured grocery-order JSON payload."""
 
-    order = {
+    return {
         "intent": "place_order",
         "language": "te-IN",
         "items": [
@@ -75,14 +74,6 @@ def make_order_payload(raw_name="బియ్యం", quantity=1):
         "needs_clarification": False,
     }
 
-    return {
-        "order_request": json.dumps(
-            order,
-            ensure_ascii=False,
-        )
-    }
-
-
 def get_order_count():
     """Count saved orders in the isolated test database."""
 
@@ -96,13 +87,13 @@ def get_order_count():
     return row["total"]
 
 
-def test_gnani_adapter_successful_order(tmp_path, monkeypatch):
-    """A valid Gnani wrapper should create a pending order."""
+def test_direct_confirmation_successful_order(tmp_path, monkeypatch):
+    """A valid direct JSON order should create a pending order."""
 
     client, shop_id = setup_test_environment(tmp_path, monkeypatch)
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers={"X-API-Key": TEST_TOKEN},
         json=make_order_payload(),
     )
@@ -123,39 +114,28 @@ def test_gnani_adapter_successful_order(tmp_path, monkeypatch):
     assert get_order_count() == 1
 
 
-def test_gnani_adapter_rejects_invalid_json(tmp_path, monkeypatch):
-    """Invalid JSON inside order_request must return HTTP 422."""
-
-    client, shop_id = setup_test_environment(tmp_path, monkeypatch)
-
-    response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_TOKEN},
-        json={"order_request": "{invalid-json"},
-    )
-
-    assert response.status_code == 422
-    assert get_order_count() == 0
-
-
-def test_gnani_adapter_rejects_missing_order_request(
+def test_direct_confirmation_rejects_malformed_json(
     tmp_path, monkeypatch
 ):
-    """The wrapper must contain an order_request string."""
+    """Malformed request JSON must return HTTP 422."""
 
     client, shop_id = setup_test_environment(tmp_path, monkeypatch)
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
-        headers={"X-API-Key": TEST_TOKEN},
-        json={"other_field": "test"},
+        f"/orders/confirm?shop_id={shop_id}",
+        headers={
+            "X-API-Key": TEST_TOKEN,
+            "Content-Type": "application/json",
+        },
+        content="{invalid-json",
     )
 
     assert response.status_code == 422
     assert get_order_count() == 0
 
 
-def test_gnani_adapter_rejects_invalid_order_model(
+
+def test_direct_confirmation_rejects_invalid_order_model(
     tmp_path, monkeypatch
 ):
     """An order without a required product name must be rejected."""
@@ -175,18 +155,16 @@ def test_gnani_adapter_rejects_invalid_order_model(
     }
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers={"X-API-Key": TEST_TOKEN},
-        json={
-            "order_request": json.dumps(invalid_order)
-        },
+        json=invalid_order,
     )
 
     assert response.status_code == 422
     assert get_order_count() == 0
 
 
-def test_gnani_adapter_rejects_missing_api_key(
+def test_direct_confirmation_rejects_missing_api_key(
     tmp_path, monkeypatch
 ):
     """Requests without authentication must be rejected."""
@@ -194,7 +172,7 @@ def test_gnani_adapter_rejects_missing_api_key(
     client, shop_id = setup_test_environment(tmp_path, monkeypatch)
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         json=make_order_payload(),
     )
 
@@ -202,7 +180,7 @@ def test_gnani_adapter_rejects_missing_api_key(
     assert get_order_count() == 0
 
 
-def test_gnani_adapter_rejects_incorrect_api_key(
+def test_direct_confirmation_rejects_incorrect_api_key(
     tmp_path, monkeypatch
 ):
     """Requests with an incorrect API key must be rejected."""
@@ -210,7 +188,7 @@ def test_gnani_adapter_rejects_incorrect_api_key(
     client, shop_id = setup_test_environment(tmp_path, monkeypatch)
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers={"X-API-Key": "incorrect-test-token"},
         json=make_order_payload(),
     )
@@ -219,7 +197,7 @@ def test_gnani_adapter_rejects_incorrect_api_key(
     assert get_order_count() == 0
 
 
-def test_gnani_adapter_rejects_insufficient_stock(
+def test_direct_confirmation_rejects_insufficient_stock(
     tmp_path, monkeypatch
 ):
     """Insufficient inventory must prevent order creation."""
@@ -231,7 +209,7 @@ def test_gnani_adapter_rejects_insufficient_stock(
     )
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers={"X-API-Key": TEST_TOKEN},
         json=make_order_payload(quantity=1),
     )
@@ -265,13 +243,13 @@ def test_same_idempotency_key_returns_original_order(
     }
 
     first = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(),
     )
 
     second = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(),
     )
@@ -299,13 +277,13 @@ def test_same_idempotency_key_rejects_different_order(
     }
 
     first = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(quantity=1),
     )
 
     second = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(quantity=2),
     )
@@ -335,13 +313,13 @@ def test_new_idempotency_key_allows_legitimate_repeat_order(
     }
 
     first = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=first_headers,
         json=make_order_payload(),
     )
 
     second = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=second_headers,
         json=make_order_payload(),
     )
@@ -384,7 +362,7 @@ def test_concurrent_same_key_creates_only_one_order(
         # Each thread gets its own TestClient.
         with TestClient(main.app) as test_client:
             return test_client.post(
-                f"/orders/confirm/gnani?shop_id={shop_id}",
+                f"/orders/confirm?shop_id={shop_id}",
                 headers=headers,
                 json=payload,
             )
@@ -430,7 +408,7 @@ def test_missing_idempotency_key_preserves_legacy_behavior(
     client, shop_id = setup_test_environment(tmp_path, monkeypatch)
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers={"X-API-Key": TEST_TOKEN},
         json=make_order_payload(),
     )
@@ -455,7 +433,7 @@ def test_empty_idempotency_key_is_rejected(
     }
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(),
     )
@@ -478,7 +456,7 @@ def test_oversized_idempotency_key_is_rejected(
     }
 
     response = client.post(
-        f"/orders/confirm/gnani?shop_id={shop_id}",
+        f"/orders/confirm?shop_id={shop_id}",
         headers=headers,
         json=make_order_payload(),
     )
@@ -519,7 +497,7 @@ def test_failed_order_insert_rolls_back_everything(
     # TestClient propagates the simulated database exception.
     with pytest.raises(sqlite3.IntegrityError):
         client.post(
-            f"/orders/confirm/gnani?shop_id={shop_id}",
+            f"/orders/confirm?shop_id={shop_id}",
             headers=headers,
             json=make_order_payload(),
         )

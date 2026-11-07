@@ -34,7 +34,7 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 - Gnani Prisma speech-to-text integration.
 - Gnani Timbre text-to-speech integration.
 - Spoken responses for inventory results.
-- Integration foundation for multilingual conversational ordering through Gnani AI.
+- Speech capabilities are provided through backend Python service modules.
 
 ### Authentication and security
 - API-key authentication.
@@ -209,7 +209,6 @@ Keep both services running while using the application.
 | POST | `/orders/preview` | Validate an order request |
 | POST | `/inventory/check?shop_id={id}` | Check shop inventory |
 | POST | `/orders/confirm?shop_id={id}` | Save a pending order |
-| POST | `/orders/confirm/gnani?shop_id={id}` | Accept Gnani order payload |
 | GET | `/orders/history?shop_id={id}` | Retrieve shop order history |
 | GET | `/orders/{order_reference}?shop_id={id}` | Retrieve an individual order |
 | POST | `/orders/{order_reference}/cancel?shop_id={id}` | Cancel a pending order |
@@ -311,7 +310,7 @@ Planned enhancements:
 - Customer account management.
 - Online payment integration.
 - Delivery status and location tracking.
-- Complete end-to-end Gnani Agent integration.
+- Direct multilingual voice orchestration using Gnani Prisma speech-to-text, Python/FastAPI, and Gnani Timbre text-to-speech.
 
 These planned enhancements are not yet claimed as production-ready features.
 

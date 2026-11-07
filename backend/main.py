@@ -106,37 +106,12 @@ async def preview_order(
     request: Request,
     api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
-    """Validate direct orders or JSON-string orders received from Gnani."""
+    """Validate a directly submitted structured grocery order."""
     authenticate_api_key(api_key)
 
     try:
         payload = await request.json()
-
-        if "order_request" in payload:
-            order_payload = payload["order_request"]
-
-            # Gnani may send the order as a JSON string.
-            if isinstance(order_payload, str):
-                order_payload = json.loads(order_payload)
-
-            if not isinstance(order_payload, dict):
-                raise ValueError("order_request must be a JSON object.")
-
-            order_payload.setdefault(
-                "intent",
-                payload.get("customer_intent", payload.get("intent", "unknown")),
-            )
-            order_payload.setdefault("language", payload.get("language"))
-
-            if payload.get("additional_instructions") is not None:
-                order_payload.setdefault(
-                    "additional_instructions",
-                    payload["additional_instructions"],
-                )
-        else:
-            order_payload = payload
-
-        order = GroceryOrder.model_validate(order_payload)
+        order = GroceryOrder.model_validate(payload)
 
     except (ValueError, TypeError) as exc:
         raise HTTPException(
@@ -401,47 +376,14 @@ async def check_inventory(
     api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
     """
-    Check requested products against one shop's catalogue.
+    Check a directly submitted grocery order against one shop's catalogue.
 
-    Accepts either a direct GroceryOrder or a JSON-string order_request.
     Does not reserve stock or place an order.
     """
     authenticate_api_key(api_key)
 
     try:
-        if "order_request" in payload:
-            order_payload = payload["order_request"]
-
-            if isinstance(order_payload, str):
-                order_payload = json.loads(order_payload)
-
-            if not isinstance(order_payload, dict):
-                raise ValueError(
-                    "order_request must be a JSON object."
-                )
-
-            order_payload.setdefault(
-                "intent",
-                payload.get(
-                    "customer_intent",
-                    payload.get("intent", "place_order"),
-                ),
-            )
-
-            order_payload.setdefault(
-                "language",
-                payload.get("language"),
-            )
-
-            if payload.get("additional_instructions") is not None:
-                order_payload.setdefault(
-                    "additional_instructions",
-                    payload["additional_instructions"],
-                )
-        else:
-            order_payload = payload
-
-        order = GroceryOrder.model_validate(order_payload)
+        order = GroceryOrder.model_validate(payload)
 
     except (ValueError, TypeError) as exc:
         raise HTTPException(
@@ -750,48 +692,6 @@ def confirm_order(
         inventory_result=inventory_result,
         idempotency_key=idempotency_key,
         request_fingerprint=request_fingerprint,
-    )
-
-
-@app.post("/orders/confirm/gnani")
-def confirm_order_from_gnani(
-    payload: dict = Body(...),
-    shop_id: int = Query(gt=0),
-    api_key: str | None = Header(default=None, alias="X-API-Key"),
-    idempotency_key: str | None = Header(
-        default=None,
-        alias="Idempotency-Key",
-    ),
-):
-    """
-    Accept Gnani's JSON-string wrapper and pass the validated
-    grocery order to the existing confirmation logic.
-    """
-
-    authenticate_api_key(api_key)
-
-    order_request = payload.get("order_request")
-
-    if not isinstance(order_request, str):
-        raise HTTPException(
-            status_code=422,
-            detail="order_request must be a JSON string.",
-        )
-
-    try:
-        order = GroceryOrder.model_validate_json(order_request)
-
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid grocery order JSON. Please check the submitted fields and data types.",
-        ) from exc
-
-    return confirm_order(
-        order=order,
-        shop_id=shop_id,
-        api_key=api_key,
-        idempotency_key=idempotency_key,
     )
 
 
