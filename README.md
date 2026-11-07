@@ -209,6 +209,8 @@ Keep both services running while using the application.
 | POST | `/orders/preview` | Validate an order request |
 | POST | `/inventory/check?shop_id={id}` | Check shop inventory |
 | POST | `/orders/confirm?shop_id={id}` | Save a pending order |
+| POST | `/orders/{order_reference}/accept?shop_id={id}` | Accept an order and reserve inventory |
+| POST | `/orders/{order_reference}/reject?shop_id={id}` | Reject a pending order with a reason |
 | GET | `/orders/history?shop_id={id}` | Retrieve shop order history |
 | GET | `/orders/{order_reference}?shop_id={id}` | Retrieve an individual order |
 | POST | `/orders/{order_reference}/cancel?shop_id={id}` | Cancel a pending order |
@@ -216,9 +218,15 @@ Keep both services running while using the application.
 | GET | `/auth/me` | Retrieve authenticated profile |
 | POST | `/admin/shops` | Register a shop |
 | POST | `/admin/shops/owners` | Create a shop-owner account |
+| POST | `/customers/register` | Register a customer account |
+| POST | `/customers/login` | Customer login |
+| GET | `/customers/me` | Retrieve the authenticated customer's profile |
 | POST | `/customers/orders/confirm` | Confirm an authenticated customer's order |
 | GET | `/customers/orders` | Retrieve the authenticated customer's orders |
 | GET | `/customers/orders/{order_reference}` | Retrieve one of the customer's own orders |
+| POST | `/customers/orders/{order_reference}/payments` | Create a Razorpay payment attempt |
+| POST | `/customers/orders/{order_reference}/payments/verify` | Verify a Razorpay payment |
+| POST | `/webhooks/razorpay` | Process verified Razorpay webhook events |
 
 Protected API routes require the appropriate authentication mechanism.
 
@@ -239,17 +247,17 @@ http://127.0.0.1:8001/docs
 
 ## Order Workflow
 
-1. Customer enters grocery items.
-2. Backend validates the request.
-3. Backend checks the selected shop's inventory.
-4. Frontend displays matching products, availability, and estimated prices.
-5. Customer explicitly confirms the order.
-6. Backend performs a fresh inventory check.
-7. Backend saves the pending order and its items transactionally.
-8. Customer can retrieve order history or look up an order.
-9. A pending order can be cancelled.
+1. Customer submits a structured grocery request.
+2. Backend validates the order and checks the selected shop's inventory.
+3. Frontend displays matched products, availability, and estimated prices.
+4. Customer explicitly confirms the order; the backend saves it as pending.
+5. An authorized shop member accepts or rejects the pending order. Acceptance reserves inventory transactionally; rejection records a reason.
+6. The customer can retrieve order history or look up an order.
+7. Eligible orders can be cancelled; applicable inventory reservations are released.
+8. For an accepted order, the authenticated customer can create a Razorpay payment attempt and verify the checkout response.
+9. Signed Razorpay webhooks update payment and refund lifecycle records.
 
-Order confirmation does not reserve stock. Shop acceptance and payment must be handled separately.
+Saving a pending order does not reserve inventory. Reservation occurs when the shop accepts the order. Online payment is handled separately from order acceptance.
 
 ## Automated Testing
 
@@ -259,7 +267,7 @@ Run the complete test suite:
 python -m pytest -q
 ```
 
-The latest local regression run on **November 7, 2026**, completed with **226 tests passed and 3 warnings**.
+The full local regression run on **November 7, 2026**, completed with **268 tests passed and 3 warnings**. After restoring the Telugu order-confirmation test fixture, that targeted test file was rerun successfully with **14 tests passed**.
 
 Additional PostgreSQL runtime verification has passed for:
 
@@ -286,7 +294,7 @@ It uses Ubuntu and Python 3.12, installs dependencies, compiles the backend and 
 
 CI uses dummy test-only environment values. Production credentials must never be used in automated test configuration.
 
-The workflow has been validated locally using CI-style environment variables, with **226 tests passing**. The GitHub-hosted workflow result is pending its first execution after the workflow is pushed to the repository.
+The local full-suite result is reported separately from GitHub-hosted Actions. Check the repository's Actions tab for the status of the latest hosted workflow run.
 
 ## Current Implementation Status
 
@@ -298,6 +306,9 @@ Implemented and tested:
 - Idempotent order confirmation.
 - Concurrent duplicate prevention.
 - Order retrieval, history, and cancellation.
+- Shop acceptance and rejection with transactional inventory reservation and release.
+- Customer-owned Razorpay payment creation and server-side payment verification.
+- Signed, idempotent Razorpay payment and refund webhook processing.
 - Shop-owner authentication and active shop-membership authorization.
 - Customer authentication and customer-scoped order access.
 - Cross-shop and customer order-data isolation.
@@ -307,8 +318,8 @@ Implemented and tested:
 - Streamlit grocery interface.
 
 Planned enhancements:
-- Customer account management.
-- Online payment integration.
+- Customer-facing account-management interface.
+- Customer-facing Razorpay checkout and payment experience.
 - Delivery status and location tracking.
 - Direct multilingual voice orchestration using Gnani Prisma speech-to-text, Python/FastAPI, and Gnani Timbre text-to-speech.
 
@@ -320,9 +331,9 @@ These planned enhancements are not yet claimed as production-ready features.
 - Use strong, unique authentication secrets.
 - Never expose API keys or database passwords in logs or screenshots.
 - Use a dedicated test database for destructive or failure-injection tests.
-- Verify payment signatures server-side when payment processing is integrated.
+- Verify Razorpay checkout signatures and webhook signatures server-side.
 - Enforce customer and shop authorization before exposing private order data.
 
 ## Future Development
 
-VoiceKirana is being developed toward a complete multilingual grocery commerce experience, including customer accounts, secure payments, messaging notifications, and delivery tracking.
+VoiceKirana is being developed toward a complete multilingual grocery commerce experience, including customer-facing account and checkout interfaces, messaging notifications, and delivery tracking.

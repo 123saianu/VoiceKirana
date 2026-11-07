@@ -54,7 +54,7 @@ def setup_test_environment(tmp_path, monkeypatch, stock_quantity=20):
     return client, shop_id
 
 
-def make_order_payload(raw_name="??????", quantity=1):
+def make_order_payload(raw_name="బియ్యం", quantity=1):
     """Create a direct structured grocery-order JSON payload."""
 
     return {
