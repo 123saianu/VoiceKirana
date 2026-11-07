@@ -263,6 +263,7 @@ VOICE_DEFAULTS = {
     "voice_temp_cleanup_error": None,
     "voice_transcription_error": None,
     "voice_extraction_error": None,
+    "voice_extraction_completed": False,
     "voice_extraction_language": None,
     "voice_order_needs_clarification": False,
     "voice_order_clarification_resolved": False,
@@ -311,6 +312,8 @@ else:
 
         st.session_state.voice_transcription_error = None
         st.session_state.voice_temp_cleanup_error = None
+        st.session_state.voice_extraction_error = None
+        st.session_state.voice_extraction_completed = False
         st.session_state.voice_temp_file_deleted = None
 
         st.session_state.voice_transcript = None
@@ -407,6 +410,7 @@ if st.session_state.voice_transcript:
         ).strip()
 
         st.session_state.voice_extraction_error = None
+        st.session_state.voice_extraction_completed = False
 
         if not transcript_for_extraction:
             st.session_state.voice_extraction_error = (
@@ -532,6 +536,7 @@ if st.session_state.voice_transcript:
                     and not has_item_clarification
                 )
                 st.session_state.voice_order_clarification_resolved = False
+                st.session_state.voice_extraction_completed = True
 
                 st.success(
                     f"Extracted {len(new_ids)} grocery item(s). "
@@ -553,10 +558,17 @@ if st.session_state.voice_transcript:
             f"Prisma request ID: {st.session_state.voice_request_id}"
         )
 
-    st.info(
-        "Transcript ready for review. It has not yet been converted "
-        "into cart items, and no order has been placed."
-    )
+    if st.session_state.voice_extraction_completed:
+        st.success(
+            "Transcript converted into editable cart items. "
+            "Review the cart before inventory validation. "
+            "No order has been placed."
+        )
+    else:
+        st.info(
+            "Transcript ready for review. It has not yet been converted "
+            "into cart items, and no order has been placed."
+        )
 
 if st.session_state.voice_temp_file_deleted is True:
     st.success("Temporary server-side audio file deleted and verified.")

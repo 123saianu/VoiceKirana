@@ -32,6 +32,7 @@ jobs:
       JWT_SECRET_KEY: ci-only-jwt-secret-key-not-for-production-123456789
       VOICEKIRANA_ADMIN_TOKEN: ci-only-admin-token
       GNANI_API_KEY_ID: ci-only-gnani-key
+      GEMINI_API_KEY: ci-only-gemini-key-not-for-production
 
       RAZORPAY_MODE: test
       RAZORPAY_KEY_ID: rzp_test_ci_dummy
@@ -55,8 +56,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Compile backend and tests
-        run: python -m compileall backend tests
+      - name: Compile frontend, backend and tests
+        run: python -m compileall frontend backend tests
 
       - name: Run complete test suite
         run: python -m pytest -q

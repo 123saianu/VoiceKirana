@@ -31,10 +31,14 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 **Important:** Saving an order does not reserve inventory or guarantee shop acceptance. Payment and delivery are separate workflows.
 
 ### Voice and AI
-- Gnani Prisma speech-to-text integration.
-- Gnani Timbre text-to-speech integration.
-- Spoken responses for inventory results.
-- Speech capabilities are provided through backend Python service modules.
+- Browser microphone input through the Streamlit frontend.
+- Gnani Prisma v3 speech-to-text with automatic language identification (Auto-LID) for supported Indic languages and English.
+- Google Gemini 3.5 Flash-Lite structured extraction of grocery requests.
+- Extraction preserves original product names, optional normalized names, quantities, units, brands, variants, and additional instructions.
+- The existing Pydantic GroceryOrder parser validates extracted data and flags missing or ambiguous details for clarification.
+- Extracted items populate an editable cart for customer review before inventory validation.
+- Gnani Timbre text-to-speech generates spoken inventory responses.
+- Voice extraction does not check inventory or place orders. Inventory validation and explicit customer confirmation remain separate steps.
 
 ### Authentication and security
 - API-key authentication.
@@ -63,7 +67,8 @@ The project combines a Python FastAPI backend, Streamlit frontend, PostgreSQL/SQ
 | Database driver | Psycopg |
 | Validation | Pydantic |
 | Authentication | JWT, Argon2 |
-| AI and speech | Gnani AI |
+| Speech services | Gnani Prisma v3, Gnani Timbre |
+| AI extraction | Google Gemini 3.5 Flash-Lite (`google-genai`) |
 | HTTP requests | Requests |
 | Testing | Pytest |
 | Configuration | Python-dotenv |
@@ -99,6 +104,7 @@ VoiceKirana/
 - Python 3.11 or later.
 - Git.
 - Gnani AI credentials for speech services.
+- A Google AI Studio Gemini API key for structured grocery extraction.
 - A configured VoiceKirana API token.
 - PostgreSQL connection details when using PostgreSQL.
 
@@ -133,6 +139,7 @@ BACKEND_URL=http://localhost:8001
 APP_NAME=VoiceKirana
 
 GNANI_API_KEY_ID=your-gnani-key-id
+GEMINI_API_KEY=your-gemini-api-key
 VOICEKIRANA_API_TOKEN=your-backend-api-token
 
 DATABASE_URL=
@@ -267,7 +274,7 @@ Run the complete test suite:
 python -m pytest -q
 ```
 
-The full local regression run on **November 7, 2026**, completed with **268 tests passed and 3 warnings**. After restoring the Telugu order-confirmation test fixture, that targeted test file was rerun successfully with **14 tests passed**.
+The local regression suite includes unit, API, and workflow tests. Live Prisma and Gemini API checks are performed separately because they require external credentials and network access.
 
 Additional PostgreSQL runtime verification has passed for:
 
@@ -314,14 +321,17 @@ Implemented and tested:
 - Cross-shop and customer order-data isolation.
 - Managed database connection lifecycle and transaction rollback.
 - Database schema constraints and foreign-key indexes.
-- Gnani Prisma speech-to-text and Timbre speech-generation integrations.
+- Gnani Prisma v3 Auto-LID and speech-to-text integration.
+- Gemini 3.5 Flash-Lite structured grocery extraction.
+- Streamlit microphone-to-transcript-to-editable-cart workflow with clarification handling.
+- Gnani Timbre speech-generation integration.
 - Streamlit grocery interface.
 
 Planned enhancements:
 - Customer-facing account-management interface.
 - Customer-facing Razorpay checkout and payment experience.
 - Delivery status and location tracking.
-- Direct multilingual voice orchestration using Gnani Prisma speech-to-text, Python/FastAPI, and Gnani Timbre text-to-speech.
+- Voice-driven order modification, cancellation, and grocery questions beyond the current new-order extraction workflow.
 
 These planned enhancements are not yet claimed as production-ready features.
 

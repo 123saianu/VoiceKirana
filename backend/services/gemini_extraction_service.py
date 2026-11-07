@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 REQUEST_TIMEOUT_MS = 120_000
+MAX_TRANSIENT_RETRIES = 1
+RETRYABLE_STATUS_CODES = frozenset({500, 503, 504})
+RETRY_DELAY_SECONDS = 1.0
 
 
 def extract_order_from_transcript(
@@ -88,17 +92,40 @@ def extract_order_from_transcript(
                 timeout=REQUEST_TIMEOUT_MS
             ),
         ) as client:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=messages[1]["content"],
-                config=types.GenerateContentConfig(
-                    system_instruction=messages[0]["content"],
-                    response_mime_type="application/json",
-                    response_schema=GeminiGroceryOrder,
-                    max_output_tokens=1500,
-                ),
-            )
+            for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=messages[1]["content"],
+                        config=types.GenerateContentConfig(
+                            system_instruction=messages[0]["content"],
+                            response_mime_type="application/json",
+                            response_schema=GeminiGroceryOrder,
+                            max_output_tokens=1500,
+                        ),
+                    )
+                    break
 
+                except Exception as request_exc:
+                    request_status = getattr(
+                        request_exc, "code", None
+                    )
+
+                    if (
+                        request_status not in RETRYABLE_STATUS_CODES
+                        or attempt >= MAX_TRANSIENT_RETRIES
+                    ):
+                        raise
+
+                    logger.warning(
+                        "Gemini temporary server error (status=%s); "
+                        "retrying once.",
+                        request_status,
+                    )
+
+                    time.sleep(
+                        RETRY_DELAY_SECONDS * (2 ** attempt)
+                    )
     except Exception as exc:
         status_code = getattr(exc, "code", None)
 
