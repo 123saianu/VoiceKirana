@@ -1,14 +1,31 @@
 
 import os
+import sys
+import tempfile
+from pathlib import Path
 import uuid
 
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+# VOICEKIRANA_PROJECT_ROOT_BOOTSTRAP
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from backend.services.timbre_service import (
     synthesize_speech,
     TimbreError,
+)
+
+from backend.services.prisma_service import (
+    transcribe_audio_with_metadata,
+)
+
+from backend.services.gemini_extraction_service import (
+    extract_order_from_transcript,
 )
 
 load_dotenv()
@@ -201,13 +218,363 @@ def remove_cart_item(item_id):
 
     st.session_state.cart_item_ids.remove(item_id)
 
-    for field in ("name", "normalized", "quantity", "unit"):
+    for field in (
+        "name",
+        "normalized",
+        "quantity",
+        "unit",
+        "brand",
+        "variant",
+        "needs_clarification",
+        "clarification_reason",
+        "clarification_resolved",
+    ):
         key = f"cart_{item_id}_{field}"
         if key in st.session_state:
             del st.session_state[key]
 
 
 st.divider()
+
+# VOICEKIRANA_MULTILINGUAL_MICROPHONE
+# ---------------------------------------------------------
+# Multilingual microphone input ? Gnani Prisma Auto-LID
+# ---------------------------------------------------------
+
+VOICE_LANGUAGE_NAMES = {
+    "en-IN": "English",
+    "hi-IN": "Hindi",
+    "bn-IN": "Bengali",
+    "gu-IN": "Gujarati",
+    "kn-IN": "Kannada",
+    "ml-IN": "Malayalam",
+    "mr-IN": "Marathi",
+    "pa-IN": "Punjabi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+}
+
+VOICE_DEFAULTS = {
+    "voice_widget_version": 0,
+    "voice_transcript": None,
+    "voice_detected_language": None,
+    "voice_request_id": None,
+    "voice_temp_file_deleted": None,
+    "voice_temp_cleanup_error": None,
+    "voice_transcription_error": None,
+    "voice_extraction_error": None,
+    "voice_extraction_language": None,
+    "voice_order_needs_clarification": False,
+    "voice_order_clarification_resolved": False,
+}
+
+for key, default in VOICE_DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+st.divider()
+st.subheader("Speak your grocery request")
+
+st.caption(
+    "Speak naturally in Telugu, English, Hindi, or another "
+    "supported language. Prisma identifies the language automatically. "
+    "You do not need to select a language before recording."
+)
+
+voice_audio = st.experimental_audio_input(
+    "Record your grocery request",
+    key=f"voice_input_{st.session_state.voice_widget_version}",
+)
+
+if voice_audio is None:
+    st.info("Use the microphone to record your grocery request.")
+
+else:
+    voice_audio_bytes = voice_audio.getvalue()
+
+    st.success("Recording received.")
+    st.caption(
+        f"Audio size: {len(voice_audio_bytes):,} bytes | "
+        f"Format: {voice_audio.type}"
+    )
+
+    st.audio(voice_audio_bytes, format="audio/wav")
+
+    if st.button(
+        "Transcribe voice request",
+        type="primary",
+        use_container_width=True,
+        key="transcribe_voice_request_button",
+    ):
+        temp_audio_path = None
+        transcription_succeeded = False
+
+        st.session_state.voice_transcription_error = None
+        st.session_state.voice_temp_cleanup_error = None
+        st.session_state.voice_temp_file_deleted = None
+
+        st.session_state.voice_transcript = None
+        st.session_state.voice_detected_language = None
+        st.session_state.voice_request_id = None
+
+        if "voice_transcript_editor" in st.session_state:
+            del st.session_state["voice_transcript_editor"]
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False,
+            ) as temp_audio:
+                temp_audio.write(voice_audio_bytes)
+                temp_audio_path = temp_audio.name
+
+            with st.spinner(
+                "Prisma is identifying the language and transcribing..."
+            ):
+                result = transcribe_audio_with_metadata(temp_audio_path)
+
+            st.session_state.voice_transcript = result.transcript
+            st.session_state.voice_detected_language = (
+                result.detected_language_code
+            )
+            st.session_state.voice_request_id = result.request_id
+
+            st.session_state.voice_transcript_editor = result.transcript
+            transcription_succeeded = True
+
+        except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+            st.session_state.voice_transcription_error = str(exc)
+
+        finally:
+            if temp_audio_path is not None:
+                try:
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
+
+                    st.session_state.voice_temp_file_deleted = (
+                        not os.path.exists(temp_audio_path)
+                    )
+
+                except OSError as exc:
+                    st.session_state.voice_temp_file_deleted = (
+                        not os.path.exists(temp_audio_path)
+                    )
+                    st.session_state.voice_temp_cleanup_error = str(exc)
+
+        if (
+            transcription_succeeded
+            and st.session_state.voice_temp_file_deleted is True
+        ):
+            st.session_state.voice_widget_version += 1
+
+        st.rerun()
+
+
+# Display the transcript after the microphone widget resets.
+if st.session_state.voice_transcript:
+    st.markdown("#### Recognized voice request")
+
+    detected_code = st.session_state.voice_detected_language
+
+    if detected_code:
+        detected_name = VOICE_LANGUAGE_NAMES.get(
+            detected_code,
+            "Other supported language",
+        )
+        st.success(
+            f"Detected language: {detected_name} ({detected_code})"
+        )
+    else:
+        st.warning(
+            "Transcript received, but Prisma did not return "
+            "a detected-language code."
+        )
+
+    st.text_area(
+        "Review or edit your transcript",
+        height=120,
+        key="voice_transcript_editor",
+    )
+
+    if st.button(
+        "Extract items from transcript",
+        type="primary",
+        use_container_width=True,
+        key="extract_voice_order_button",
+    ):
+        transcript_for_extraction = st.session_state.get(
+            "voice_transcript_editor", ""
+        ).strip()
+
+        st.session_state.voice_extraction_error = None
+
+        if not transcript_for_extraction:
+            st.session_state.voice_extraction_error = (
+                "Enter or record a grocery request before extraction."
+            )
+        else:
+            # A new extraction invalidates any previous inventory preview.
+            st.session_state.pending_order_payload = None
+            st.session_state.pending_shop_id = None
+            st.session_state.pending_idempotency_key = None
+            st.session_state.saved_order_result = None
+
+            try:
+                with st.spinner(
+                    "Gemini is identifying products and quantities..."
+                ):
+                    extracted_order = extract_order_from_transcript(
+                        transcript=transcript_for_extraction,
+                        detected_language_code=(
+                            st.session_state.voice_detected_language
+                        ),
+                    )
+
+                if extracted_order.intent != "place_order":
+                    raise ValueError(
+                        "This request was not identified as a new grocery "
+                        "order. Edit the transcript and try again."
+                    )
+
+                if not extracted_order.items:
+                    raise ValueError(
+                        "No grocery items were extracted. "
+                        "Please edit the transcript and try again."
+                    )
+
+                # Remove the previous cart rows and their widget values.
+                old_ids = list(st.session_state.cart_item_ids)
+
+                cart_fields = (
+                    "name",
+                    "normalized",
+                    "quantity",
+                    "unit",
+                    "brand",
+                    "variant",
+                    "needs_clarification",
+                    "clarification_reason",
+                    "clarification_resolved",
+                )
+
+                for old_id in old_ids:
+                    for field in cart_fields:
+                        state_key = f"cart_{old_id}_{field}"
+                        st.session_state.pop(state_key, None)
+
+                # Allocate fresh IDs so stale Streamlit widget values
+                # cannot overwrite the extracted items.
+                first_new_id = st.session_state.next_cart_item_id
+                new_ids = []
+
+                for index, extracted_item in enumerate(
+                    extracted_order.items
+                ):
+                    item_id = first_new_id + index
+                    new_ids.append(item_id)
+
+                    st.session_state[f"cart_{item_id}_name"] = (
+                        extracted_item.raw_name
+                    )
+                    st.session_state[
+                        f"cart_{item_id}_normalized"
+                    ] = extracted_item.normalized_name or ""
+                    st.session_state[
+                        f"cart_{item_id}_quantity"
+                    ] = (
+                        extracted_item.quantity
+                        if extracted_item.quantity is not None
+                        else 0.0
+                    )
+                    st.session_state[f"cart_{item_id}_unit"] = (
+                        extracted_item.unit or ""
+                    )
+                    st.session_state[f"cart_{item_id}_brand"] = (
+                        extracted_item.brand or ""
+                    )
+                    st.session_state[f"cart_{item_id}_variant"] = (
+                        extracted_item.variant or ""
+                    )
+                    st.session_state[
+                        f"cart_{item_id}_needs_clarification"
+                    ] = bool(extracted_item.needs_clarification)
+                    st.session_state[
+                        f"cart_{item_id}_clarification_reason"
+                    ] = extracted_item.clarification_reason or ""
+                    st.session_state[
+                        f"cart_{item_id}_clarification_resolved"
+                    ] = False
+
+                st.session_state.cart_item_ids = new_ids
+                st.session_state.next_cart_item_id = (
+                    first_new_id + len(new_ids)
+                )
+
+                # Preserve language and additional instructions returned
+                # by the validated extraction.
+                st.session_state.voice_extraction_language = (
+                    extracted_order.language
+                    or st.session_state.voice_detected_language
+                )
+                st.session_state["additional_instructions_editor"] = (
+                    extracted_order.additional_instructions or ""
+                )
+
+                # If order-level clarification is not explained by an
+                # individual flagged item, require a separate review.
+                has_item_clarification = any(
+                    item.needs_clarification
+                    for item in extracted_order.items
+                )
+
+                st.session_state.voice_order_needs_clarification = (
+                    bool(extracted_order.needs_clarification)
+                    and not has_item_clarification
+                )
+                st.session_state.voice_order_clarification_resolved = False
+
+                st.success(
+                    f"Extracted {len(new_ids)} grocery item(s). "
+                    "Review the cart and resolve any warnings."
+                )
+                st.rerun()
+
+            except (ValueError, RuntimeError) as exc:
+                st.session_state.voice_extraction_error = str(exc)
+
+    if st.session_state.voice_extraction_error:
+        st.error(
+            "Gemini extraction failed: "
+            f"{st.session_state.voice_extraction_error}"
+        )
+
+    if st.session_state.voice_request_id:
+        st.caption(
+            f"Prisma request ID: {st.session_state.voice_request_id}"
+        )
+
+    st.info(
+        "Transcript ready for review. It has not yet been converted "
+        "into cart items, and no order has been placed."
+    )
+
+if st.session_state.voice_temp_file_deleted is True:
+    st.success("Temporary server-side audio file deleted and verified.")
+
+elif st.session_state.voice_temp_file_deleted is False:
+    st.error("Temporary server-side audio file could not be deleted.")
+
+    if st.session_state.voice_temp_cleanup_error:
+        st.code(st.session_state.voice_temp_cleanup_error)
+
+if st.session_state.voice_transcription_error:
+    st.error(
+        "Voice transcription failed: "
+        f"{st.session_state.voice_transcription_error}"
+    )
+
+st.divider()
+
 st.subheader("🛒 Grocery order")
 
 st.info(
@@ -296,7 +663,56 @@ for item_id in list(st.session_state.cart_item_ids):
             args=(item_id,),
         )
 
+    brand_col, variant_col = st.columns(2)
+
+    with brand_col:
+        st.text_input(
+            "Brand (optional)",
+            placeholder="e.g. Aashirvaad",
+            key=f"cart_{item_id}_brand",
+        )
+
+    with variant_col:
+        st.text_input(
+            "Variant (optional)",
+            placeholder="e.g. sona masoori",
+            key=f"cart_{item_id}_variant",
+        )
+
+    if st.session_state.get(
+        f"cart_{item_id}_needs_clarification", False
+    ):
+        reason = st.session_state.get(
+            f"cart_{item_id}_clarification_reason", ""
+        )
+
+        st.warning(
+            "This item needs your review: "
+            + (reason or "Please verify the product details.")
+        )
+
+        st.checkbox(
+            "I have reviewed and resolved this item",
+            key=f"cart_{item_id}_clarification_resolved",
+        )
+
     st.divider()
+
+if st.session_state.voice_order_needs_clarification:
+    st.warning(
+        "Gemini flagged the overall request for review. "
+        "Please check the transcript and extracted cart carefully."
+    )
+    st.checkbox(
+        "I have reviewed and resolved the overall request",
+        key="voice_order_clarification_resolved",
+    )
+
+st.text_area(
+    "Additional instructions (optional)",
+    height=80,
+    key="additional_instructions_editor",
+)
 
 submitted = st.button(
     "Validate cart and check inventory",
@@ -341,8 +757,46 @@ if submitted:
             f"cart_{item_id}_unit", ""
         ).strip()
 
+        brand = st.session_state.get(
+            f"cart_{item_id}_brand", ""
+        ).strip()
+
+        variant = st.session_state.get(
+            f"cart_{item_id}_variant", ""
+        ).strip()
+
+        needs_clarification = bool(
+            st.session_state.get(
+                f"cart_{item_id}_needs_clarification", False
+            )
+        )
+
+        clarification_resolved = bool(
+            st.session_state.get(
+                f"cart_{item_id}_clarification_resolved", False
+            )
+        )
+
         # Ignore a completely untouched empty row.
-        if not name and not normalized and not unit and quantity == 0:
+        if (
+            not name
+            and not normalized
+            and not unit
+            and not brand
+            and not variant
+            and quantity == 0
+        ):
+            continue
+
+        if needs_clarification and not clarification_resolved:
+            reason = st.session_state.get(
+                f"cart_{item_id}_clarification_reason", ""
+            )
+            validation_errors.append(
+                f"Item {item_number} ({name or 'unnamed item'}): "
+                "resolve the clarification before checking inventory. "
+                f"{reason}"
+            )
             continue
 
         if not name:
@@ -375,6 +829,12 @@ if submitted:
         if normalized:
             item["normalized_name"] = normalized
 
+        if brand:
+            item["brand"] = brand
+
+        if variant:
+            item["variant"] = variant
+
         order_items.append(item)
 
     if validation_errors:
@@ -389,13 +849,38 @@ if submitted:
     order_payload = {
         "intent": "place_order",
         "language": (
-            None
-            if language == "Other / unspecified"
-            else language
+            st.session_state.get("voice_extraction_language")
+            or (
+                None
+                if language == "Other / unspecified"
+                else language
+            )
         ),
         "items": order_items,
         "needs_clarification": False,
     }
+
+    additional_instructions = st.session_state.get(
+        "additional_instructions_editor", ""
+    ).strip()
+
+    if additional_instructions:
+        order_payload["additional_instructions"] = (
+            additional_instructions
+        )
+
+    if (
+        st.session_state.voice_order_needs_clarification
+        and not st.session_state.voice_order_clarification_resolved
+    ):
+        validation_errors.append(
+            "Review and resolve the overall order clarification."
+        )
+
+    if validation_errors:
+        for error in validation_errors:
+            st.error(error)
+        st.stop()
 
     headers = {"X-API-Key": api_token}
 

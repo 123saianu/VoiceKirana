@@ -1,10 +1,11 @@
+
 import logging
 import os
+from dataclasses import dataclass
 
 import requests
 from dotenv import load_dotenv
 
-# Load credentials from the project's .env file.
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -12,11 +13,31 @@ logger = logging.getLogger(__name__)
 GNANI_API_KEY_ID = os.getenv("GNANI_API_KEY_ID")
 GNANI_STT_URL = "https://api.vachana.ai/stt/v3"
 
+PRISMA_MODEL = "prisma-v3.0"
+AUTO_LANGUAGE_CODE = "indic-auto"
+DEFAULT_FORMAT = "transcribe"
 
-def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """Transcript and metadata returned by Gnani Prisma."""
+
+    transcript: str
+    detected_language_code: str | None
+    request_id: str | None
+
+
+def transcribe_audio_with_metadata(
+    audio_path: str,
+    language_code: str = AUTO_LANGUAGE_CODE,
+) -> TranscriptionResult:
     """
-    Convert a Telugu or Telugu-English audio recording into text
-    using Gnani Prisma Speech-to-Text.
+    Transcribe audio using Prisma v3.0.
+
+    By default, indic-auto enables automatic identification across
+    Prisma's supported Indian languages and English.
+
+    A specific BCP-47 language code can still be supplied when needed.
     """
 
     if not GNANI_API_KEY_ID:
@@ -28,12 +49,15 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
         raise FileNotFoundError("Audio file not found.")
 
     headers = {
-        "X-API-Key-ID": GNANI_API_KEY_ID
+        "X-API-Key-ID": GNANI_API_KEY_ID,
     }
 
+    # Prisma v3.0 is opt-in. Both model and language_code
+    # must be sent to enable automatic language identification.
     data = {
+        "model": PRISMA_MODEL,
         "language_code": language_code,
-        "format": "transcribe"
+        "format": DEFAULT_FORMAT,
     }
 
     try:
@@ -41,7 +65,7 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
             files = {
                 "audio_file": (
                     os.path.basename(audio_path),
-                    audio_file
+                    audio_file,
                 )
             }
 
@@ -50,7 +74,7 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
                 headers=headers,
                 data=data,
                 files=files,
-                timeout=60
+                timeout=60,
             )
 
         response.raise_for_status()
@@ -60,7 +84,7 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
         except ValueError:
             logger.warning(
                 "Gnani STT returned invalid JSON (HTTP %s).",
-                response.status_code
+                response.status_code,
             )
             raise RuntimeError(
                 "Gnani returned an invalid response. Please try again."
@@ -74,8 +98,8 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
 
         if result.get("success") is not True:
             logger.warning(
-                "Gnani STT reported an unsuccessful transcription (HTTP %s).",
-                response.status_code
+                "Gnani STT reported unsuccessful transcription (HTTP %s).",
+                response.status_code,
             )
             raise RuntimeError(
                 "Gnani transcription failed. Please try again."
@@ -86,7 +110,23 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
         if not isinstance(transcript, str) or not transcript.strip():
             raise RuntimeError("Gnani returned an empty transcript.")
 
-        return transcript.strip()
+        detected_language = result.get("detected_language_code")
+        if not isinstance(detected_language, str) or not detected_language.strip():
+            detected_language = None
+        else:
+            detected_language = detected_language.strip()
+
+        request_id = result.get("request_id")
+        if not isinstance(request_id, str) or not request_id.strip():
+            request_id = None
+        else:
+            request_id = request_id.strip()
+
+        return TranscriptionResult(
+            transcript=transcript.strip(),
+            detected_language_code=detected_language,
+            request_id=request_id,
+        )
 
     except requests.exceptions.Timeout:
         logger.warning("Gnani STT request timed out.")
@@ -99,19 +139,47 @@ def transcribe_audio(audio_path: str, language_code: str = "te-IN") -> str:
 
         logger.warning(
             "Gnani STT HTTP request failed (status=%s).",
-            status_code
+            status_code,
         )
 
+        message = (
+            f"Gnani API request failed (HTTP {status_code})."
+        )
+
+        if status_code in (400, 403, 404):
+            message += (
+                " Verify that Prisma v3.0 is available "
+                "for this API key."
+            )
+
         raise RuntimeError(
-            f"Gnani API request failed (HTTP {status_code}). Please try again."
+            message + " Please try again."
         ) from None
 
     except requests.exceptions.RequestException as error:
         logger.warning(
             "Gnani STT connection failed (%s).",
-            type(error).__name__
+            type(error).__name__,
         )
 
         raise RuntimeError(
             "Could not connect to Gnani. Please try again."
         ) from None
+
+
+def transcribe_audio(
+    audio_path: str,
+    language_code: str = AUTO_LANGUAGE_CODE,
+) -> str:
+    """
+    Backward-compatible helper that returns only the transcript.
+
+    Existing callers do not need to handle metadata.
+    """
+
+    result = transcribe_audio_with_metadata(
+        audio_path,
+        language_code=language_code,
+    )
+
+    return result.transcript
