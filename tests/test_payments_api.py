@@ -1,12 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
 
 from contextlib import closing
 from unittest.mock import Mock
+
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
 import backend.database as database
 import backend.main as main
+from backend.security import create_access_token
 
 from backend.services.inventory_service import (
     create_shop,
@@ -74,8 +78,105 @@ def prepare_customer(client, email):
     }
 
 
+def accept_order_as_shop(client, shop_id, order_reference):
+    """Accept a customer order using an authenticated shop owner."""
+    with database.get_connection() as connection:
+        with connection:
+            user_id = connection.insert_returning_id(
+                """
+                INSERT INTO users (
+                    email,
+                    full_name,
+                    password_hash
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    f"payment-shop-owner-{shop_id}@example.com",
+                    "Payment Test Shop Owner",
+                    "unused-test-password-hash",
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO shop_memberships (
+                    user_id,
+                    shop_id,
+                    role
+                )
+                VALUES (?, ?, 'owner')
+                """,
+                (user_id, shop_id),
+            )
+
+    token = create_access_token(user_id)
+    response = client.post(
+        f"/orders/{order_reference}/accept?shop_id={shop_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "confirmed"
+    return response.json()
+
+
+def payment_test_shop_owner_headers(shop_id):
+    """Create an authenticated shop owner for cancellation tests."""
+    with database.get_connection() as connection:
+        with connection:
+            user_id = connection.insert_returning_id(
+                """
+                INSERT INTO users (
+                    email,
+                    full_name,
+                    password_hash
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    f"payment-cancel-owner-{shop_id}@example.com",
+                    "Payment Cancellation Test Owner",
+                    "unused-test-password-hash",
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO shop_memberships (
+                    user_id,
+                    shop_id,
+                    role
+                )
+                VALUES (?, ?, 'owner')
+                """,
+                (user_id, shop_id),
+            )
+
+    return {
+        "Authorization": f"Bearer {create_access_token(user_id)}"
+    }
+
+
+def get_reserved_stock_for_order(shop_id, order):
+    product_id = order["items"][0]["product_id"]
+
+    with database.get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT reserved_quantity
+            FROM inventory
+            WHERE shop_id = ? AND product_id = ?
+            """,
+            (shop_id, product_id),
+        ).fetchone()
+
+    assert row is not None
+    return float(row["reserved_quantity"])
+
+
 def prepare_customer_order(client, email="buyer@example.com"):
-    """Create an authenticated customer and a pending rice order."""
+    """Create an authenticated customer and a shop-accepted rice order."""
 
     customer = prepare_customer(client, email)
 
@@ -114,7 +215,14 @@ def prepare_customer_order(client, email="buyer@example.com"):
 
     assert response.status_code == 201
 
-    return customer, shop_id, response.json()
+    order_data = response.json()
+    accept_order_as_shop(
+        client,
+        shop_id,
+        order_data["order_reference"],
+    )
+
+    return customer, shop_id, order_data
 
 
 def mock_razorpay(monkeypatch, side_effect=None):
@@ -260,9 +368,14 @@ def test_customer_cannot_pay_another_customers_order(
     print("PASS: Cross-customer payment access rejected")
 
 
-def test_non_pending_order_cannot_be_paid(
+@pytest.mark.parametrize(
+    "blocked_status",
+    ["pending", "cancelled", "rejected"],
+)
+def test_non_confirmed_order_cannot_be_paid(
     client,
     monkeypatch,
+    blocked_status,
 ):
     mock = mock_razorpay(monkeypatch)
 
@@ -271,8 +384,8 @@ def test_non_pending_order_cannot_be_paid(
     with database.get_connection() as connection:
         with connection:
             connection.execute(
-                "UPDATE orders SET status = 'confirmed' WHERE id = ?",
-                (order["order_id"],),
+                "UPDATE orders SET status = ? WHERE id = ?",
+                (blocked_status, order["order_id"]),
             )
 
     response = create_payment(
@@ -282,9 +395,10 @@ def test_non_pending_order_cannot_be_paid(
     )
 
     assert response.status_code == 409
+    assert "Only shop-accepted orders" in response.json()["detail"]
     mock.assert_not_called()
 
-    print("PASS: Non-pending order cannot be paid")
+    print(f"PASS: {blocked_status} order cannot start payment")
 
 
 def test_order_below_minimum_amount_cannot_be_paid(
@@ -599,7 +713,7 @@ def test_valid_captured_payment_is_verified(client, monkeypatch):
             (order["order_id"],),
         ).fetchone()
 
-    assert saved_order["status"] == "pending"
+    assert saved_order["status"] == "confirmed"
 
     print("PASS: Captured payment verified without changing order acceptance")
 
@@ -1029,10 +1143,10 @@ def test_valid_captured_webhook_updates_payment(
             (order["order_id"],),
         ).fetchone()
 
-    assert saved_order["status"] == "pending"
+    assert saved_order["status"] == "confirmed"
     assert _get_webhook_event_count() == 1
 
-    print("PASS: Captured webhook updates payment without accepting grocery order")
+    print("PASS: Captured webhook updates payment without changing shop acceptance")
 
 
 def test_invalid_webhook_signature_is_rejected(
@@ -1383,3 +1497,509 @@ def test_mismatched_event_and_payment_status_are_rejected(
     assert _get_webhook_event_count() == 0
 
     print("PASS: Mismatched webhook event and payment status rejected")
+
+def _build_razorpay_refund_webhook_payload(
+    event_type,
+    refund_status,
+    amount_refunded,
+    refund_amount=2500,
+    refund_id="rfnd_test123",
+    payment_id="pay_test123",
+    refund_payment_id=None,
+):
+    import json
+
+    payload = {
+        "entity": "event",
+        "event": event_type,
+        "contains": ["refund", "payment"],
+        "payload": {
+            "refund": {
+                "entity": {
+                    "id": refund_id,
+                    "entity": "refund",
+                    "amount": refund_amount,
+                    "currency": "INR",
+                    "payment_id": refund_payment_id or payment_id,
+                    "status": refund_status,
+                },
+            },
+            "payment": {
+                "entity": {
+                    "id": payment_id,
+                    "entity": "payment",
+                    "order_id": "order_test123",
+                    "amount": 6800,
+                    "currency": "INR",
+                    "status": "captured",
+                    "captured": True,
+                    "amount_refunded": amount_refunded,
+                    "refund_status": (
+                        "full" if amount_refunded == 6800
+                        else "partial" if amount_refunded > 0
+                        else None
+                    ),
+                },
+            },
+        },
+    }
+
+    return json.dumps(payload).encode("utf-8")
+
+
+def _prepare_captured_webhook_payment(client, monkeypatch, email):
+    customer, order, created, _ = prepare_payment_for_verification(
+        client,
+        monkeypatch,
+        email,
+    )
+
+    with database.get_connection() as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE payments
+                SET status = 'captured',
+                    razorpay_payment_id = 'pay_test123'
+                WHERE id = ?
+                """,
+                (created["payment_id"],),
+            )
+
+    monkeypatch.setattr(
+        main,
+        "verify_webhook_signature",
+        Mock(return_value=True),
+    )
+
+    return customer, order, created
+
+
+def test_partial_refund_webhook_updates_cumulative_amount(
+    client,
+    monkeypatch,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client, monkeypatch, "refund-partial@example.com"
+    )
+
+    raw_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=2500,
+        refund_amount=2500,
+    )
+
+    response = _send_razorpay_webhook(
+        client, raw_body, event_id="refund-partial-event"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["payment_updated"] is True
+    assert response.json()["payment_status"] == "captured"
+    assert response.json()["amount_refunded_paise"] == 2500
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "captured"
+    assert payment["amount_refunded_paise"] == 2500
+
+
+def test_full_refund_webhook_marks_payment_refunded(
+    client,
+    monkeypatch,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client, monkeypatch, "refund-full@example.com"
+    )
+
+    raw_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=6800,
+        refund_amount=6800,
+        refund_id="rfnd_full123",
+    )
+
+    response = _send_razorpay_webhook(
+        client, raw_body, event_id="refund-full-event"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["payment_status"] == "refunded"
+    assert response.json()["amount_refunded_paise"] == 6800
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "refunded"
+    assert payment["amount_refunded_paise"] == 6800
+
+
+def test_out_of_order_refund_events_never_reduce_refunded_amount(
+    client,
+    monkeypatch,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client, monkeypatch, "refund-ordering@example.com"
+    )
+
+    first_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=3000,
+        refund_amount=3000,
+        refund_id="rfnd_first123",
+    )
+    second_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=5000,
+        refund_amount=2000,
+        refund_id="rfnd_second123",
+    )
+    older_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=3000,
+        refund_amount=3000,
+        refund_id="rfnd_first123",
+    )
+
+    first = _send_razorpay_webhook(
+        client, first_body, event_id="refund-order-event-1"
+    )
+    second = _send_razorpay_webhook(
+        client, second_body, event_id="refund-order-event-2"
+    )
+    older = _send_razorpay_webhook(
+        client, older_body, event_id="refund-order-event-3"
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert older.status_code == 200
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["amount_refunded_paise"] == 5000
+    assert payment["status"] == "captured"
+
+
+@pytest.mark.parametrize(
+    "event_type, refund_status",
+    [
+        ("refund.created", "pending"),
+        ("refund.failed", "failed"),
+        ("refund.speed_changed", "processed"),
+    ],
+)
+def test_non_processed_refund_events_do_not_change_refunded_amount(
+    client,
+    monkeypatch,
+    event_type,
+    refund_status,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client,
+        monkeypatch,
+        f"refund-nonprocessed-{event_type.replace('.', '-') }@example.com",
+    )
+
+    raw_body = _build_razorpay_refund_webhook_payload(
+        event_type,
+        refund_status,
+        amount_refunded=0,
+        refund_amount=2500,
+    )
+
+    response = _send_razorpay_webhook(
+        client,
+        raw_body,
+        event_id=f"nonprocessed-{event_type}",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["payment_updated"] is False
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["status"] == "captured"
+    assert payment["amount_refunded_paise"] == 0
+
+
+def test_refund_webhook_rejects_mismatched_payment_id(
+    client,
+    monkeypatch,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client, monkeypatch, "refund-payment-mismatch@example.com"
+    )
+
+    raw_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=2500,
+        refund_amount=2500,
+        refund_payment_id="pay_another123",
+    )
+
+    response = _send_razorpay_webhook(
+        client, raw_body, event_id="refund-mismatch-event"
+    )
+
+    assert response.status_code == 400
+    assert "IDs do not match" in response.json()["detail"]
+    assert _get_webhook_event_count() == 0
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["amount_refunded_paise"] == 0
+
+
+def test_duplicate_refund_webhook_event_is_idempotent(
+    client,
+    monkeypatch,
+):
+    _, order, created = _prepare_captured_webhook_payment(
+        client, monkeypatch, "refund-duplicate@example.com"
+    )
+
+    raw_body = _build_razorpay_refund_webhook_payload(
+        "refund.processed",
+        "processed",
+        amount_refunded=2500,
+        refund_amount=2500,
+    )
+
+    first = _send_razorpay_webhook(
+        client, raw_body, event_id="refund-duplicate-event"
+    )
+    second = _send_razorpay_webhook(
+        client, raw_body, event_id="refund-duplicate-event"
+    )
+
+    assert first.status_code == 200
+    assert first.json()["payment_updated"] is True
+    assert second.status_code == 200
+    assert second.json()["status"] == "duplicate"
+
+    payment = get_payment_record(created["payment_id"])
+    assert payment["amount_refunded_paise"] == 2500
+    assert _get_webhook_event_count() == 1
+
+@pytest.mark.parametrize(
+    "payment_status",
+    ["creating", "created", "authorized", "captured"],
+)
+def test_cancellation_blocked_while_payment_is_active(
+    client,
+    monkeypatch,
+    payment_status,
+):
+    mock = mock_razorpay(monkeypatch)
+
+    customer, shop_id, order = prepare_customer_order(
+        client,
+        f"active-payment-{payment_status}@example.com",
+    )
+
+    payment_response = create_payment(
+        client,
+        order["order_reference"],
+        customer,
+        f"active-{payment_status}-key",
+    )
+
+    assert payment_response.status_code == 201
+
+    with database.get_connection() as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE payments
+                SET status = ?
+                WHERE id = ?
+                """,
+                (payment_status, payment_response.json()["payment_id"]),
+            )
+
+    shop_headers = payment_test_shop_owner_headers(shop_id)
+
+    cancellation = client.post(
+        f"/orders/{order['order_reference']}/cancel?shop_id={shop_id}",
+        headers=shop_headers,
+    )
+
+    assert cancellation.status_code == 409
+    assert "active or captured payment" in cancellation.json()["detail"]
+
+    lookup = client.get(
+        f"/orders/{order['order_reference']}?shop_id={shop_id}",
+        headers=shop_headers,
+    )
+
+    assert lookup.status_code == 200
+    assert lookup.json()["status"] == "confirmed"
+    assert get_reserved_stock_for_order(shop_id, order) == 1
+
+    mock.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    ["failed", "creation_failed", "refunded"],
+)
+def test_cancellation_allowed_after_payment_is_terminal(
+    client,
+    monkeypatch,
+    terminal_status,
+):
+    mock = mock_razorpay(monkeypatch)
+
+    customer, shop_id, order = prepare_customer_order(
+        client,
+        f"terminal-payment-{terminal_status}@example.com",
+    )
+
+    payment_response = create_payment(
+        client,
+        order["order_reference"],
+        customer,
+        f"terminal-{terminal_status}-key",
+    )
+
+    assert payment_response.status_code == 201
+
+    with database.get_connection() as connection:
+        with connection:
+            if terminal_status == "refunded":
+                connection.execute(
+                    """
+                    UPDATE payments
+                    SET status = 'refunded',
+                        amount_refunded_paise = amount_paise
+                    WHERE id = ?
+                    """,
+                    (payment_response.json()["payment_id"],),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE payments
+                    SET status = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        terminal_status,
+                        payment_response.json()["payment_id"],
+                    ),
+                )
+
+    shop_headers = payment_test_shop_owner_headers(shop_id)
+
+    cancellation = client.post(
+        f"/orders/{order['order_reference']}/cancel?shop_id={shop_id}",
+        headers=shop_headers,
+    )
+
+    assert cancellation.status_code == 200
+    assert cancellation.json()["status"] == "cancelled"
+    assert cancellation.json()["stock_released"] is True
+    assert get_reserved_stock_for_order(shop_id, order) == 0
+
+    mock.assert_called_once()
+
+def test_payment_creation_and_cancellation_are_serialized(
+    client,
+    monkeypatch,
+):
+    mock = mock_razorpay(monkeypatch)
+
+    customer, shop_id, order = prepare_customer_order(
+        client,
+        "payment-cancellation-race@example.com",
+    )
+
+    shop_headers = payment_test_shop_owner_headers(shop_id)
+    barrier = threading.Barrier(3)
+
+    def start_payment():
+        barrier.wait(timeout=10)
+        return create_payment(
+            client,
+            order["order_reference"],
+            customer,
+            "concurrent-payment-key",
+        )
+
+    def cancel_order():
+        barrier.wait(timeout=10)
+        return client.post(
+            f"/orders/{order['order_reference']}/cancel?shop_id={shop_id}",
+            headers=shop_headers,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        payment_future = executor.submit(start_payment)
+        cancellation_future = executor.submit(cancel_order)
+
+        # Release both requests at nearly the same time.
+        barrier.wait(timeout=10)
+
+        payment_response = payment_future.result(timeout=30)
+        cancellation_response = cancellation_future.result(timeout=30)
+
+    payment_status = payment_response.status_code
+    cancellation_status = cancellation_response.status_code
+
+    with database.get_connection() as connection:
+        final_order = connection.execute(
+            """
+            SELECT status
+            FROM orders
+            WHERE id = ?
+            """,
+            (order["order_id"],),
+        ).fetchone()
+
+        payment_rows = connection.execute(
+            """
+            SELECT status
+            FROM payments
+            WHERE order_id = ?
+            """,
+            (order["order_id"],),
+        ).fetchall()
+
+    reserved_quantity = get_reserved_stock_for_order(shop_id, order)
+
+    if payment_status == 201:
+        # Payment creation won the order-row lock.
+        assert cancellation_status == 409
+        assert final_order["status"] == "confirmed"
+        assert len(payment_rows) == 1
+        assert payment_rows[0]["status"] in {"creating", "created"}
+        assert reserved_quantity == 1
+
+    elif payment_status == 409:
+        # Cancellation won the order-row lock.
+        assert cancellation_status == 200
+        assert final_order["status"] == "cancelled"
+        assert len(payment_rows) == 0
+        assert reserved_quantity == 0
+
+    else:
+        pytest.fail(
+            "Unexpected concurrent result: "
+            f"payment={payment_status}, "
+            f"cancellation={cancellation_status}, "
+            f"payment_body={payment_response.text}, "
+            f"cancellation_body={cancellation_response.text}"
+        )
+
+    if payment_status == 201:
+        mock.assert_called_once()
+    else:
+        mock.assert_not_called()
+
+    print(
+        "PASS: Concurrent payment creation and cancellation were serialized."
+    )

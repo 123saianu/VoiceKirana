@@ -1,7 +1,7 @@
 
 from typing import Optional, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RequestedItem(BaseModel):
@@ -85,3 +85,18 @@ class GroceryOrder(BaseModel):
             item.needs_clarification for item in self.items
         )
         return self.needs_clarification
+
+class OrderRejectionRequest(BaseModel):
+    """Validated reason supplied by a shop when rejecting an order."""
+
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        value = value.strip()
+
+        if len(value) < 3:
+            raise ValueError("Rejection reason must contain at least 3 characters.")
+
+        return value

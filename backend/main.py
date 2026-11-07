@@ -41,7 +41,7 @@ from backend.models.catalogue import (
     InventoryUpdate,
     ProductAliasCreate,
 )
-from backend.models.order import GroceryOrder
+from backend.models.order import GroceryOrder, OrderRejectionRequest
 from backend.security import (
     hash_password,
     verify_password,
@@ -317,11 +317,17 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
             all_items_matched = False
             continue
 
-        if match["stock_quantity"] < item.quantity:
+        available_quantity = max(
+            0.0,
+            float(match["stock_quantity"])
+            - float(match.get("reserved_quantity", 0) or 0),
+        )
+
+        if available_quantity < item.quantity:
             results.append({
                 "requested_name": item.raw_name,
                 "status": "insufficient_stock",
-                "available_quantity": match["stock_quantity"],
+                "available_quantity": available_quantity,
                 "requested_quantity": item.quantity,
                 "unit": match["base_unit"],
             })
@@ -345,7 +351,7 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
             "unit_price_rupees": round(price_paise / 100, 2),
             "line_total_paise": line_total_paise,
             "line_total_rupees": round(line_total_paise / 100, 2),
-            "available_quantity": match["stock_quantity"],
+            "available_quantity": available_quantity,
         })
 
     if not all_items_matched:
@@ -817,7 +823,8 @@ def order_history(
                 order_reference,
                 status,
                 total_amount,
-                created_at
+                created_at,
+                rejection_reason
             FROM orders
             WHERE shop_id = ?
             ORDER BY id DESC
@@ -850,6 +857,7 @@ def order_history(
                 "order_id": saved_order["id"],
                 "order_reference": saved_order["order_reference"],
                 "status": saved_order["status"],
+                "rejection_reason": saved_order["rejection_reason"],
                 "total_paise": saved_order["total_amount"],
                 "total_rupees": round(
                     saved_order["total_amount"] / 100, 2
@@ -897,9 +905,19 @@ def _load_order_details(connection, order_row):
         (order_row["id"],),
     ).fetchall()
 
+    rejection_row = connection.execute(
+        "SELECT rejection_reason FROM orders WHERE id = ?",
+        (order_row["id"],),
+    ).fetchone()
+
     total_paise = order_row["total_amount"]
     return {
         "order_id": order_row["id"],
+        "rejection_reason": (
+            rejection_row["rejection_reason"]
+            if rejection_row is not None
+            else None
+        ),
         "order_reference": order_row["order_reference"],
         "shop_id": order_row["shop_id"],
         "status": order_row["status"],
@@ -964,20 +982,36 @@ def cancel_order(
         require_shop_access("owner", "manager")
     ),
 ):
-    """Cancel a pending order and persist the status change."""
+    """
+    Cancel a pending or accepted order.
+
+    Pending orders have no stock reservation to release.
+    Confirmed orders release their reserved quantities atomically.
+    """
 
     with get_connection() as connection:
         shop = connection.execute(
             "SELECT id FROM shops WHERE id = ? AND is_active = 1",
             (shop_id,),
         ).fetchone()
+
         if shop is None:
-            raise HTTPException(status_code=404, detail="Active shop not found.")
+            raise HTTPException(
+                status_code=404,
+                detail="Active shop not found.",
+            )
 
         with connection:
             order_row = connection.execute(
                 """
-                SELECT id, order_reference, shop_id, status, total_amount, created_at
+                SELECT
+                    id,
+                    order_reference,
+                    shop_id,
+                    status,
+                    total_amount,
+                    created_at,
+                    rejection_reason
                 FROM orders
                 WHERE order_reference = ? AND shop_id = ?
                 """,
@@ -985,34 +1019,140 @@ def cancel_order(
             ).fetchone()
 
             if order_row is None:
-                raise HTTPException(status_code=404, detail="Order not found.")
+                raise HTTPException(
+                    status_code=404,
+                    detail="Order not found.",
+                )
 
-            if order_row["status"] != "pending":
+            previous_status = order_row["status"]
+
+            if previous_status not in {"pending", "confirmed"}:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Only pending orders can be cancelled. "
-                        f"Current status: {order_row['status']}."
+                        "Only pending or confirmed orders can be cancelled. "
+                        f"Current status: {previous_status}."
                     ),
                 )
 
+            # Claim the cancellation before releasing inventory.
+            # The conditional update prevents duplicate stock releases.
             cursor = connection.execute(
                 """
                 UPDATE orders
                 SET status = 'cancelled'
-                WHERE id = ? AND status = 'pending'
+                WHERE id = ? AND status = ?
                 """,
-                (order_row["id"],),
+                (order_row["id"], previous_status),
             )
+
             if cursor.rowcount != 1:
                 raise HTTPException(
                     status_code=409,
-                    detail="The order status changed before cancellation completed.",
+                    detail=(
+                        "The order status changed before cancellation "
+                        "completed. Please refresh the order."
+                    ),
                 )
+
+            # Active payment attempts may still become captured.
+            # Keep the order and reservation intact until resolution.
+            active_payment = connection.execute(
+                """
+                SELECT id, status
+                FROM payments
+                WHERE order_id = ?
+                  AND status IN (
+                      'creating',
+                      'created',
+                      'authorized',
+                      'captured'
+                  )
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (order_row["id"],),
+            ).fetchone()
+
+            if active_payment is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This order has an active or captured payment. "
+                        "Resolve or fully refund the payment before "
+                        "cancelling the order."
+                    ),
+                )
+
+            released_items = []
+
+            if previous_status == "confirmed":
+                item_rows = connection.execute(
+                    """
+                    SELECT
+                        product_id,
+                        SUM(quantity) AS total_quantity
+                    FROM order_items
+                    WHERE order_id = ?
+                    GROUP BY product_id
+                    """,
+                    (order_row["id"],),
+                ).fetchall()
+
+                if not item_rows:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The accepted order has no items to release "
+                            "from inventory. Cancellation was rolled back."
+                        ),
+                    )
+
+                for item in item_rows:
+                    product_id = item["product_id"]
+                    quantity = float(item["total_quantity"])
+
+                    release_cursor = connection.execute(
+                        """
+                        UPDATE inventory
+                        SET reserved_quantity = reserved_quantity - ?
+                        WHERE shop_id = ?
+                          AND product_id = ?
+                          AND reserved_quantity >= ?
+                        """,
+                        (
+                            quantity,
+                            shop_id,
+                            product_id,
+                            quantity,
+                        ),
+                    )
+
+                    if release_cursor.rowcount != 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The reserved inventory does not match "
+                                "this order. Cancellation was rolled back "
+                                "to prevent an incorrect stock release."
+                            ),
+                        )
+
+                    released_items.append({
+                        "product_id": product_id,
+                        "quantity": quantity,
+                    })
 
         updated_order = connection.execute(
             """
-            SELECT id, order_reference, shop_id, status, total_amount, created_at
+            SELECT
+                id,
+                order_reference,
+                shop_id,
+                status,
+                total_amount,
+                created_at,
+                rejection_reason
             FROM orders
             WHERE id = ?
             """,
@@ -1021,10 +1161,296 @@ def cancel_order(
 
         result = _load_order_details(connection, updated_order)
 
+    stock_released = previous_status == "confirmed"
+
+    result["stock_released"] = stock_released
+    result["released_items"] = released_items
+
+    if stock_released:
+        result["message"] = (
+            "The accepted order was cancelled. Its reserved inventory "
+            "has been released and is available for other orders."
+        )
+    else:
+        result["message"] = (
+            "The pending order was cancelled. No inventory had been "
+            "reserved, so stock was unchanged."
+        )
+
+    return result
+
+@app.post("/orders/{order_reference}/accept")
+def accept_order(
+    order_reference: str,
+    shop_id: int = Query(gt=0),
+    shop_access: dict = Depends(
+        require_shop_access("owner", "manager")
+    ),
+):
+    """Accept a pending order and reserve all its inventory atomically."""
+
+    reserved_items = []
+
+    with get_connection() as connection:
+        with connection:
+            shop = connection.execute(
+                "SELECT id FROM shops WHERE id = ? AND is_active = 1",
+                (shop_id,),
+            ).fetchone()
+
+            if shop is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active shop not found.",
+                )
+
+            order_row = connection.execute(
+                """
+                SELECT id, status
+                FROM orders
+                WHERE order_reference = ? AND shop_id = ?
+                """,
+                (order_reference, shop_id),
+            ).fetchone()
+
+            if order_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Order not found.",
+                )
+
+            if order_row["status"] != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Only pending orders can be accepted. "
+                        f"Current status: {order_row['status']}."
+                    ),
+                )
+
+            order_items = connection.execute(
+                """
+                SELECT
+                    oi.product_id,
+                    p.name AS product_name,
+                    SUM(oi.quantity) AS requested_quantity
+                FROM order_items AS oi
+                JOIN products AS p ON p.id = oi.product_id
+                WHERE oi.order_id = ?
+                GROUP BY oi.product_id, p.name
+                ORDER BY oi.product_id
+                """,
+                (order_row["id"],),
+            ).fetchall()
+
+            if not order_items:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The order contains no inventory items to reserve.",
+                )
+
+            # Reserve each product with a conditional atomic update.
+            # The surrounding transaction rolls back every reservation
+            # if any product cannot be reserved.
+            for item in order_items:
+                quantity = float(item["requested_quantity"])
+
+                cursor = connection.execute(
+                    """
+                    UPDATE inventory
+                    SET reserved_quantity = reserved_quantity + ?
+                    WHERE shop_id = ?
+                      AND product_id = ?
+                      AND is_available = 1
+                      AND stock_quantity - reserved_quantity >= ?
+                    """,
+                    (
+                        quantity,
+                        shop_id,
+                        item["product_id"],
+                        quantity,
+                    ),
+                )
+
+                if cursor.rowcount != 1:
+                    stock = connection.execute(
+                        """
+                        SELECT stock_quantity, reserved_quantity, is_available
+                        FROM inventory
+                        WHERE shop_id = ? AND product_id = ?
+                        """,
+                        (shop_id, item["product_id"]),
+                    ).fetchone()
+
+                    available = 0.0
+                    if stock is not None and stock["is_available"]:
+                        available = max(
+                            0.0,
+                            float(stock["stock_quantity"])
+                            - float(stock["reserved_quantity"]),
+                        )
+
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": (
+                                "The order could not be accepted because "
+                                "available inventory changed."
+                            ),
+                            "product_name": item["product_name"],
+                            "available_quantity": available,
+                            "requested_quantity": quantity,
+                        },
+                    )
+
+                reserved_items.append({
+                    "product_id": item["product_id"],
+                    "product_name": item["product_name"],
+                    "reserved_quantity": quantity,
+                })
+
+            # Change order status only after all products are reserved.
+            # Conditional status update protects against competing decisions.
+            cursor = connection.execute(
+                """
+                UPDATE orders
+                SET status = 'confirmed'
+                WHERE id = ?
+                  AND shop_id = ?
+                  AND status = 'pending'
+                """,
+                (order_row["id"], shop_id),
+            )
+
+            if cursor.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The order status changed before acceptance completed."
+                    ),
+                )
+
+            updated_order = connection.execute(
+                """
+                SELECT
+                    id,
+                    order_reference,
+                    shop_id,
+                    status,
+                    total_amount,
+                    created_at
+                FROM orders
+                WHERE id = ?
+                """,
+                (order_row["id"],),
+            ).fetchone()
+
+            result = _load_order_details(connection, updated_order)
+
     result["message"] = (
-        "The pending order was cancelled. No stock reservation was made by "
-        "VoiceKirana, so no stock was returned to inventory."
+        "The shop accepted the order and inventory was reserved."
     )
+    result["stock_reserved"] = True
+    result["reserved_items"] = reserved_items
+
+    return result
+
+
+@app.post("/orders/{order_reference}/reject")
+def reject_order(
+    order_reference: str,
+    payload: OrderRejectionRequest,
+    shop_id: int = Query(gt=0),
+    shop_access: dict = Depends(
+        require_shop_access("owner", "manager")
+    ),
+):
+    """Allow an authorized shop member to reject a pending order."""
+
+    with get_connection() as connection:
+        with connection:
+            shop = connection.execute(
+                "SELECT id FROM shops WHERE id = ? AND is_active = 1",
+                (shop_id,),
+            ).fetchone()
+
+            if shop is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active shop not found.",
+                )
+
+            order_row = connection.execute(
+                """
+                SELECT id, status
+                FROM orders
+                WHERE order_reference = ? AND shop_id = ?
+                """,
+                (order_reference, shop_id),
+            ).fetchone()
+
+            if order_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Order not found.",
+                )
+
+            if order_row["status"] != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Only pending orders can be rejected. "
+                        f"Current status: {order_row['status']}."
+                    ),
+                )
+
+            # The conditional update prevents two competing decisions
+            # from both changing the same pending order.
+            cursor = connection.execute(
+                """
+                UPDATE orders
+                SET
+                    status = 'rejected',
+                    rejection_reason = ?
+                WHERE id = ?
+                  AND shop_id = ?
+                  AND status = 'pending'
+                """,
+                (
+                    payload.reason,
+                    order_row["id"],
+                    shop_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The order status changed before rejection completed."
+                    ),
+                )
+
+            updated_order = connection.execute(
+                """
+                SELECT
+                    id,
+                    order_reference,
+                    shop_id,
+                    status,
+                    total_amount,
+                    created_at
+                FROM orders
+                WHERE id = ?
+                """,
+                (order_row["id"],),
+            ).fetchone()
+
+            result = _load_order_details(connection, updated_order)
+
+    result["message"] = "The shop rejected the order."
+    result["stock_reserved"] = False
+
     return result
 
 
@@ -1549,10 +1975,12 @@ def create_customer_payment(
                 detail="Order not found.",
             )
 
-        if order["status"] != "pending":
+        if order["status"] != "confirmed":
             raise HTTPException(
                 status_code=409,
-                detail="Only pending orders can start a payment.",
+                detail=(
+                    "Only shop-accepted orders can start a payment."
+                ),
             )
 
         amount_paise = order["total_amount"]
@@ -1636,6 +2064,27 @@ def create_customer_payment(
     try:
         with get_connection() as connection:
             with connection:
+                # Lock the order row before inserting a payment attempt.
+                # This serializes payment creation against cancellation.
+                order_guard = connection.execute(
+                    """
+                    UPDATE orders
+                    SET status = status
+                    WHERE id = ?
+                      AND status = 'confirmed'
+                    """,
+                    (order_id,),
+                )
+
+                if order_guard.rowcount != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "This order is no longer shop-accepted. "
+                            "Refresh its status before starting payment."
+                        ),
+                    )
+
                 payment_id = connection.insert_returning_id(
                     """
                     INSERT INTO payments (
@@ -2096,6 +2545,15 @@ async def handle_razorpay_webhook(request: Request):
         "payment.failed": "failed",
     }
 
+    supported_refund_events = {
+        "refund.created",
+        "refund.processed",
+        "refund.failed",
+        "refund.speed_changed",
+    }
+
+    is_refund_event = event_type in supported_refund_events
+    event_accepted = False
     target_status = supported_events.get(event_type)
 
     provider_payment_id = None
@@ -2118,6 +2576,128 @@ async def handle_razorpay_webhook(request: Request):
         payment_entity = {}
 
     provider_payment_id = payment_entity.get("id")
+
+    refund_id = None
+    refund_status = None
+    refund_amount = None
+    provider_amount_refunded = None
+    final_amount_refunded_paise = None
+
+    if is_refund_event:
+        refund_data = payload.get("refund")
+        if not isinstance(refund_data, dict):
+            refund_data = {}
+
+        refund_entity = refund_data.get("entity")
+        if not isinstance(refund_entity, dict):
+            refund_entity = {}
+
+        refund_id = refund_entity.get("id")
+        refund_status = refund_entity.get("status")
+        refund_amount = refund_entity.get("amount")
+        refund_currency = refund_entity.get("currency")
+        refund_payment_id = refund_entity.get("payment_id")
+
+        provider_order_id = payment_entity.get("order_id")
+        provider_amount = payment_entity.get("amount")
+        provider_currency = payment_entity.get("currency")
+        provider_amount_refunded = payment_entity.get("amount_refunded")
+
+        if (
+            not isinstance(refund_id, str)
+            or not refund_id.startswith("rfnd_")
+            or len(refund_id) > 100
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid refund ID in webhook payload.",
+            )
+
+        if (
+            not isinstance(provider_payment_id, str)
+            or not provider_payment_id.startswith("pay_")
+            or len(provider_payment_id) > 100
+            or refund_payment_id != provider_payment_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Refund and payment IDs do not match.",
+            )
+
+        if (
+            not isinstance(provider_order_id, str)
+            or not provider_order_id.startswith("order_")
+            or len(provider_order_id) > 100
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Razorpay order ID in refund payload.",
+            )
+
+        if type(provider_amount) is not int or provider_amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid original payment amount in refund payload.",
+            )
+
+        if (
+            type(provider_amount_refunded) is not int
+            or provider_amount_refunded < 0
+            or provider_amount_refunded > provider_amount
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid cumulative refunded amount in webhook payload.",
+            )
+
+        if (
+            type(refund_amount) is not int
+            or refund_amount <= 0
+            or refund_amount > provider_amount
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid refund amount in webhook payload.",
+            )
+
+        if refund_currency != "INR" or provider_currency != "INR":
+            raise HTTPException(
+                status_code=400,
+                detail="Unexpected refund or payment currency.",
+            )
+
+        if refund_status not in {"pending", "processed", "failed"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown refund status in webhook payload.",
+            )
+
+        if (
+            event_type == "refund.processed"
+            and refund_status != "processed"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Processed refund event has an inconsistent status.",
+            )
+
+        if (
+            event_type == "refund.failed"
+            and refund_status != "failed"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Failed refund event has an inconsistent status.",
+            )
+
+        if (
+            event_type == "refund.processed"
+            and provider_amount_refunded < refund_amount
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Cumulative refunded amount is smaller than this refund.",
+            )
 
     if target_status is not None:
         provider_order_id = payment_entity.get("order_id")
@@ -2310,6 +2890,87 @@ async def handle_razorpay_webhook(request: Request):
                         final_payment_status = updated_payment["status"]
                         payment_updated = True
 
+            elif is_refund_event:
+                payment = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        amount_paise,
+                        currency,
+                        status,
+                        amount_refunded_paise
+                    FROM payments
+                    WHERE razorpay_payment_id = ?
+                      AND razorpay_order_id = ?
+                    """,
+                    (provider_payment_id, provider_order_id),
+                ).fetchone()
+
+                if (
+                    payment is not None
+                    and payment["amount_paise"] == provider_amount
+                    and payment["currency"] == provider_currency
+                ):
+                    event_accepted = True
+                    final_payment_status = payment["status"]
+                    final_amount_refunded_paise = (
+                        payment["amount_refunded_paise"]
+                    )
+
+                    # Only a successfully processed refund changes
+                    # the cumulative refunded amount.
+                    if (
+                        event_type == "refund.processed"
+                        and payment["status"] in {"captured", "refunded"}
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE payments
+                            SET
+                                amount_refunded_paise = CASE
+                                    WHEN amount_refunded_paise < ?
+                                        THEN ?
+                                    ELSE amount_refunded_paise
+                                END,
+                                status = CASE
+                                    WHEN (
+                                        CASE
+                                            WHEN amount_refunded_paise < ?
+                                                THEN ?
+                                            ELSE amount_refunded_paise
+                                        END
+                                    ) >= amount_paise
+                                        THEN 'refunded'
+                                    ELSE status
+                                END,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                              AND status IN ('captured', 'refunded')
+                            """,
+                            (
+                                provider_amount_refunded,
+                                provider_amount_refunded,
+                                provider_amount_refunded,
+                                provider_amount_refunded,
+                                payment["id"],
+                            ),
+                        )
+
+                        updated_payment = connection.execute(
+                            """
+                            SELECT status, amount_refunded_paise
+                            FROM payments
+                            WHERE id = ?
+                            """,
+                            (payment["id"],),
+                        ).fetchone()
+
+                        final_payment_status = updated_payment["status"]
+                        final_amount_refunded_paise = (
+                            updated_payment["amount_refunded_paise"]
+                        )
+                        payment_updated = True
+
     if duplicate:
         return {
             "status": "duplicate",
@@ -2318,14 +2979,25 @@ async def handle_razorpay_webhook(request: Request):
             "message": "Webhook event was already processed.",
         }
 
-    return {
-        "status": "accepted" if payment_updated else "ignored",
+    response = {
+        "status": (
+            "accepted"
+            if payment_updated or event_accepted
+            else "ignored"
+        ),
         "duplicate": False,
         "event_id": event_id,
         "event_type": event_type,
         "payment_updated": payment_updated,
         "payment_status": final_payment_status,
     }
+
+    if is_refund_event:
+        response["refund_id"] = refund_id
+        response["refund_event_status"] = refund_status
+        response["amount_refunded_paise"] = final_amount_refunded_paise
+
+    return response
 
 # ============================================================
 # SHOP CATALOGUE MANAGEMENT

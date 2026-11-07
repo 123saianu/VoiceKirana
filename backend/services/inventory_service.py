@@ -67,7 +67,7 @@ def set_inventory(
         if product is None:
             raise ValueError("Product not found.")
 
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO inventory
                 (shop_id, product_id, price_per_unit,
@@ -77,6 +77,7 @@ def set_inventory(
                 price_per_unit = excluded.price_per_unit,
                 stock_quantity = excluded.stock_quantity,
                 is_available = excluded.is_available
+            WHERE excluded.stock_quantity >= inventory.reserved_quantity
             """,
             (
                 shop_id,
@@ -86,6 +87,12 @@ def set_inventory(
                 int(is_available),
             )
         )
+
+        if cursor.rowcount != 1:
+            raise ValueError(
+                "Physical stock cannot be reduced below the quantity "
+                "already reserved for accepted orders."
+            )
 
 
 def add_product_alias(product_id: int, alias: str) -> None:
@@ -145,6 +152,7 @@ def find_inventory(shop_id: int, product_name: str) -> list[dict]:
                 p.base_unit,
                 i.price_per_unit,
                 i.stock_quantity,
+                i.reserved_quantity,
                 i.is_available
             FROM inventory i
             JOIN products p ON p.id = i.product_id
@@ -167,6 +175,7 @@ def find_inventory(shop_id: int, product_name: str) -> list[dict]:
                     p.base_unit,
                     i.price_per_unit,
                     i.stock_quantity,
+                    i.reserved_quantity,
                     i.is_available
                 FROM product_aliases a
                 JOIN products p ON p.id = a.product_id

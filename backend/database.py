@@ -130,6 +130,335 @@ def get_connection():
     return DatabaseConnection(connection, is_postgres=False)
 
 
+
+def _migrate_sqlite_orders_schema():
+    """Safely rebuild the SQLite orders table while preserving related rows."""
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+
+    try:
+        # Must be disabled before beginning the migration transaction.
+        raw_connection.execute("PRAGMA foreign_keys = OFF")
+        raw_connection.execute("BEGIN IMMEDIATE")
+
+        table_row = raw_connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'orders'
+            """
+        ).fetchone()
+
+        if table_row is None:
+            raw_connection.commit()
+            return
+
+        table_sql = table_row[0] or ""
+
+        columns = {
+            row[1]
+            for row in raw_connection.execute(
+                "PRAGMA table_info(orders)"
+            ).fetchall()
+        }
+
+        # The migration is idempotent.
+        if "'rejected'" in table_sql and "rejection_reason" in columns:
+            raw_connection.commit()
+            return
+
+        old_sequence = None
+        try:
+            sequence_row = raw_connection.execute(
+                """
+                SELECT seq FROM sqlite_sequence
+                WHERE name = 'orders'
+                """
+            ).fetchone()
+
+            if sequence_row is not None:
+                old_sequence = sequence_row[0]
+        except sqlite3.OperationalError:
+            pass
+
+        reason_expression = (
+            "rejection_reason"
+            if "rejection_reason" in columns
+            else "NULL"
+        )
+
+        raw_connection.execute("DROP TABLE IF EXISTS orders_new")
+
+        raw_connection.execute(
+            """
+            CREATE TABLE orders_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_reference TEXT NOT NULL UNIQUE,
+                shop_id INTEGER NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN (
+                        'pending',
+                        'confirmed',
+                        'cancelled',
+                        'rejected'
+                    )),
+                total_amount INTEGER NOT NULL DEFAULT 0
+                    CHECK (total_amount >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                rejection_reason TEXT,
+                FOREIGN KEY (shop_id) REFERENCES shops(id)
+            )
+            """
+        )
+
+        raw_connection.execute(
+            f"""
+            INSERT INTO orders_new (
+                id,
+                order_reference,
+                shop_id,
+                status,
+                total_amount,
+                created_at,
+                rejection_reason
+            )
+            SELECT
+                id,
+                order_reference,
+                shop_id,
+                status,
+                total_amount,
+                created_at,
+                {reason_expression}
+            FROM orders
+            """
+        )
+
+        raw_connection.execute("DROP TABLE orders")
+        raw_connection.execute(
+            "ALTER TABLE orders_new RENAME TO orders"
+        )
+
+        # Preserve the old AUTOINCREMENT sequence if it exceeded
+        # the highest order ID still present.
+        if old_sequence is not None:
+            sequence_row = raw_connection.execute(
+                """
+                SELECT seq FROM sqlite_sequence
+                WHERE name = 'orders'
+                """
+            ).fetchone()
+
+            if sequence_row is None:
+                raw_connection.execute(
+                    """
+                    INSERT INTO sqlite_sequence (name, seq)
+                    VALUES ('orders', ?)
+                    """,
+                    (old_sequence,),
+                )
+            elif sequence_row[0] < old_sequence:
+                raw_connection.execute(
+                    """
+                    UPDATE sqlite_sequence
+                    SET seq = ?
+                    WHERE name = 'orders'
+                    """,
+                    (old_sequence,),
+                )
+
+        raw_connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_shop_status
+            ON orders(shop_id, status)
+            """
+        )
+
+        violations = raw_connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"Foreign-key violations after orders migration: {violations[:5]}"
+            )
+
+        raw_connection.commit()
+        raw_connection.execute("PRAGMA foreign_keys = ON")
+
+        violations = raw_connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"Foreign-key violations after migration: {violations[:5]}"
+            )
+
+    except Exception:
+        if raw_connection.in_transaction:
+            raw_connection.rollback()
+        raise
+
+    finally:
+        if raw_connection.in_transaction:
+            raw_connection.rollback()
+
+        try:
+            raw_connection.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.Error:
+            pass
+
+        raw_connection.close()
+
+
+def _migrate_postgres_orders_schema():
+    """Upgrade PostgreSQL order status schema only when required."""
+    with get_connection() as connection:
+        column = connection.execute(
+            """
+            SELECT 1 AS present
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'orders'
+              AND column_name = 'rejection_reason'
+            """
+        ).fetchone()
+
+        if column is None:
+            connection.execute(
+                """
+                ALTER TABLE orders
+                ADD COLUMN rejection_reason TEXT
+                """
+            )
+
+        constraint = connection.execute(
+            """
+            SELECT pg_get_constraintdef(oid) AS definition
+            FROM pg_constraint
+            WHERE conrelid = 'orders'::regclass
+              AND conname = 'orders_status_check'
+              AND contype = 'c'
+            """
+        ).fetchone()
+
+        if constraint is None or "'rejected'" not in constraint["definition"]:
+            if constraint is not None:
+                connection.execute(
+                    """
+                    ALTER TABLE orders
+                    DROP CONSTRAINT orders_status_check
+                    """
+                )
+
+            connection.execute(
+                """
+                ALTER TABLE orders
+                ADD CONSTRAINT orders_status_check
+                CHECK (status IN (
+                    'pending',
+                    'confirmed',
+                    'cancelled',
+                    'rejected'
+                ))
+                """
+            )
+
+
+def _migrate_inventory_reservations_schema():
+    """Add reserved stock tracking to existing SQLite/PostgreSQL databases."""
+    with get_connection() as connection:
+        if DATABASE_URL:
+            column = connection.execute(
+                """
+                SELECT 1 AS present
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'inventory'
+                  AND column_name = 'reserved_quantity'
+                """
+            ).fetchone()
+
+            if column is None:
+                connection.execute(
+                    """
+                    ALTER TABLE inventory
+                    ADD COLUMN reserved_quantity REAL NOT NULL DEFAULT 0
+                    CHECK (
+                        reserved_quantity >= 0
+                        AND reserved_quantity <= stock_quantity
+                    )
+                    """
+                )
+        else:
+            columns = connection.execute(
+                "PRAGMA table_info(inventory)"
+            ).fetchall()
+
+            if not any(row["name"] == "reserved_quantity" for row in columns):
+                connection.execute(
+                    """
+                    ALTER TABLE inventory
+                    ADD COLUMN reserved_quantity REAL NOT NULL DEFAULT 0
+                    CHECK (
+                        reserved_quantity >= 0
+                        AND reserved_quantity <= stock_quantity
+                    )
+                    """
+                )
+
+
+
+def _migrate_payment_refunds_schema():
+    """Add cumulative refund tracking to existing payment tables."""
+    with get_connection() as connection:
+        if DATABASE_URL:
+            column = connection.execute(
+                """
+                SELECT 1 AS present
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'payments'
+                  AND column_name = 'amount_refunded_paise'
+                """
+            ).fetchone()
+
+            if column is None:
+                connection.execute(
+                    """
+                    ALTER TABLE payments
+                    ADD COLUMN amount_refunded_paise INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (
+                        amount_refunded_paise >= 0
+                        AND amount_refunded_paise <= amount_paise
+                    )
+                    """
+                )
+        else:
+            columns = connection.execute(
+                "PRAGMA table_info(payments)"
+            ).fetchall()
+
+            if not any(
+                row["name"] == "amount_refunded_paise"
+                for row in columns
+            ):
+                connection.execute(
+                    """
+                    ALTER TABLE payments
+                    ADD COLUMN amount_refunded_paise INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (
+                        amount_refunded_paise >= 0
+                        AND amount_refunded_paise <= amount_paise
+                    )
+                    """
+                )
+
+
 def initialize_database():
     """Create the tables required for multi-shop grocery ordering."""
 
@@ -218,6 +547,11 @@ def initialize_database():
         price_per_unit INTEGER NOT NULL CHECK (price_per_unit >= 0),
         stock_quantity REAL NOT NULL DEFAULT 0
             CHECK (stock_quantity >= 0),
+        reserved_quantity REAL NOT NULL DEFAULT 0
+            CHECK (
+                reserved_quantity >= 0
+                AND reserved_quantity <= stock_quantity
+            ),
         is_available INTEGER NOT NULL DEFAULT 1
             CHECK (is_available IN (0, 1)),
         FOREIGN KEY (shop_id) REFERENCES shops(id),
@@ -233,11 +567,13 @@ def initialize_database():
             CHECK (status IN (
                 'pending',
                 'confirmed',
-                'cancelled'
+                'cancelled',
+                'rejected'
             )),
         total_amount INTEGER NOT NULL DEFAULT 0
             CHECK (total_amount >= 0),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        rejection_reason TEXT,
         FOREIGN KEY (shop_id) REFERENCES shops(id)
     );
 
@@ -283,6 +619,12 @@ def initialize_database():
 
         amount_paise INTEGER NOT NULL
             CHECK (amount_paise > 0),
+
+        amount_refunded_paise INTEGER NOT NULL DEFAULT 0
+            CHECK (
+                amount_refunded_paise >= 0
+                AND amount_refunded_paise <= amount_paise
+            ),
 
         currency TEXT NOT NULL DEFAULT 'INR'
             CHECK (currency = 'INR'),
@@ -399,6 +741,15 @@ def initialize_database():
         for statement in schema.split(";"):
             if statement.strip():
                 connection.execute(statement)
+
+    # Upgrade existing databases after creating any missing tables.
+    if DATABASE_URL:
+        _migrate_postgres_orders_schema()
+    else:
+        _migrate_sqlite_orders_schema()
+
+    _migrate_inventory_reservations_schema()
+    _migrate_payment_refunds_schema()
 
 
 if __name__ == "__main__":
