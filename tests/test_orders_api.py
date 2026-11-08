@@ -74,6 +74,95 @@ def create_shop_owner_headers(shop_id, role="owner"):
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_public_shop_directory_lists_active_shops(client):
+    active_shop_id = create_shop("Public Catalogue Test Shop")
+    inactive_shop_id = create_shop("Inactive Catalogue Test Shop")
+
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE shops SET is_active = 0 WHERE id = ?",
+            (inactive_shop_id,),
+        )
+
+    # No API key or shop-owner JWT is supplied.
+    response = client.get("/shops")
+
+    assert response.status_code == 200
+
+    body = response.json()
+    returned_ids = {
+        shop["shop_id"] for shop in body["shops"]
+    }
+
+    assert active_shop_id in returned_ids
+    assert inactive_shop_id not in returned_ids
+    assert body["count"] == len(body["shops"])
+
+
+def test_public_shop_directory_sorts_names_case_insensitively(client):
+    create_shop("zeta Grocery")
+    create_shop("Alpha Grocery")
+    create_shop("beta Grocery")
+
+    response = client.get("/shops")
+
+    assert response.status_code == 200
+
+    names = [
+        shop["shop_name"]
+        for shop in response.json()["shops"]
+    ]
+
+    assert names == sorted(names, key=str.casefold)
+
+
+def test_public_shop_catalogue_hides_exact_stock_quantities(client):
+    shop_id = create_shop("Public Product Catalogue Test Shop")
+
+    product_id = create_product(
+        name="Rice",
+        base_unit="kg",
+        brand="Aashirvaad",
+        variant="Sona Masoori",
+    )
+
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=20,
+        is_available=True,
+    )
+
+    # Public catalogue access must not require staff authentication.
+    response = client.get(f"/shops/{shop_id}/catalogue")
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["shop_id"] == shop_id
+    assert body["count"] == 1
+
+    item = body["items"][0]
+
+    assert item["product_id"] == product_id
+    assert item["name"] == "Rice"
+    assert item["brand"] == "Aashirvaad"
+    assert item["variant"] == "Sona Masoori"
+    assert item["base_unit"] == "kg"
+    assert item["price_rupees"] == 65.0
+    assert item["is_available"] is True
+
+    assert "stock_quantity" not in item
+    assert "reserved_quantity" not in item
+
+
+def test_public_catalogue_rejects_inactive_or_unknown_shop(client):
+    response = client.get("/shops/999999/catalogue")
+
+    assert response.status_code == 404
+
+
 def test_health_endpoint(client):
     response = client.get("/health")
 

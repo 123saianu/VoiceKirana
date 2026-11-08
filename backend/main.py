@@ -101,6 +101,70 @@ def health_check():
     }
 
 
+@app.get("/shops")
+def list_active_shops():
+    """List active shop names and IDs for customer shop selection."""
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, name
+            FROM shops
+            WHERE is_active = 1
+            ORDER BY LOWER(name), id
+            """
+        ).fetchall()
+
+    shops = [
+        {
+            "shop_id": row["id"],
+            "shop_name": row["name"],
+        }
+        for row in rows
+    ]
+
+    return {
+        "count": len(shops),
+        "shops": shops,
+    }
+
+
+@app.get("/shops/{shop_id}/catalogue")
+def get_public_shop_catalogue(shop_id: int):
+    """
+    Return customer-facing catalogue information for an active shop.
+
+    Exact physical and reserved stock quantities remain private.
+    """
+
+    try:
+        inventory_items = get_shop_inventory(shop_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Active shop not found.",
+        ) from exc
+
+    items = [
+        {
+            "product_id": item["product_id"],
+            "name": item["name"],
+            "brand": item.get("brand"),
+            "variant": item.get("variant"),
+            "base_unit": item["base_unit"],
+            "price_rupees": item["price_rupees"],
+            "is_available": item["is_available"],
+        }
+        for item in inventory_items
+    ]
+
+    return {
+        "shop_id": shop_id,
+        "count": len(items),
+        "items": items,
+    }
+
+
 @app.post("/orders/preview")
 async def preview_order(
     request: Request,
