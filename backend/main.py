@@ -29,6 +29,7 @@ from backend.models.auth import (
     LoginRequest,
     AdminCreateShopRequest,
     AdminCreateShopOwnerRequest,
+    AdminSetShopVisibilityRequest,
     AccessTokenResponse,
     CurrentUserResponse,
 )
@@ -111,6 +112,7 @@ def list_active_shops():
             SELECT id, name
             FROM shops
             WHERE is_active = 1
+              AND is_customer_visible = 1
             ORDER BY LOWER(name), id
             """
         ).fetchall()
@@ -136,6 +138,24 @@ def get_public_shop_catalogue(shop_id: int):
 
     Exact physical and reserved stock quantities remain private.
     """
+
+    with get_connection() as connection:
+        visible_shop = connection.execute(
+            """
+            SELECT id
+            FROM shops
+            WHERE id = ?
+              AND is_active = 1
+              AND is_customer_visible = 1
+            """,
+            (shop_id,),
+        ).fetchone()
+
+    if visible_shop is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Active shop not found.",
+        )
 
     try:
         inventory_items = get_shop_inventory(shop_id)
@@ -207,43 +227,8 @@ async def preview_order(
     }
 
 
-def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
-    """
-    Shared inventory-checking logic.
-
-    Can be called directly by confirm_order() or through the
-    /inventory/check HTTP endpoint.
-    Does not reserve stock or place an order.
-    """
-
-    if order.needs_clarification:
-        return {
-            "status": "needs_clarification",
-            "message": "Clarify the grocery request before checking inventory.",
-            "needs_clarification": True,
-            "items": [],
-            "total_paise": None,
-            "total_rupees": None,
-        }
-
-    if not order.items:
-        raise HTTPException(
-            status_code=400,
-            detail="The grocery order must contain at least one item.",
-        )
-
-    # Verify that the requested shop exists and is active.
-    with get_connection() as connection:
-        shop = connection.execute(
-            "SELECT id, name FROM shops WHERE id = ? AND is_active = 1",
-            (shop_id,),
-        ).fetchone()
-
-    if shop is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Active shop not found.",
-        )
+def _evaluate_inventory_for_shop(order, shop, find_matches):
+    """Evaluate one order against preloaded or live shop inventory."""
 
     results = []
     total_paise = 0
@@ -272,7 +257,7 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
             else item.raw_name.strip()
         )
 
-        matches = find_inventory(shop_id, search_name)
+        matches = find_matches(search_name)
 
         if not matches:
             results.append({
@@ -283,7 +268,6 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
             all_items_matched = False
             continue
 
-        # Never silently choose between different brands or variants.
         if len(matches) > 1:
             results.append({
                 "requested_name": item.raw_name,
@@ -305,7 +289,6 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
 
         match = matches[0]
 
-        # No unit conversions are performed in this first version.
         requested_unit = item.unit.strip().casefold()
         catalogue_unit = match["base_unit"].strip().casefold()
 
@@ -420,7 +403,7 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
             "No stock has been reserved and no order has been placed."
         ),
         "needs_clarification": False,
-        "shop_id": shop_id,
+        "shop_id": shop["id"],
         "shop_name": shop["name"],
         "items": results,
         "total_paise": total_paise,
@@ -428,6 +411,50 @@ def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
         "order_placed": False,
         "stock_reserved": False,
     }
+
+
+def _check_inventory_for_order(order: GroceryOrder, shop_id: int) -> dict:
+    """Check one active, customer-visible shop using the shared matcher."""
+
+    if order.needs_clarification:
+        return {
+            "status": "needs_clarification",
+            "message": "Clarify the grocery request before checking inventory.",
+            "needs_clarification": True,
+            "items": [],
+            "total_paise": None,
+            "total_rupees": None,
+        }
+
+    if not order.items:
+        raise HTTPException(
+            status_code=400,
+            detail="The grocery order must contain at least one item.",
+        )
+
+    with get_connection() as connection:
+        shop = connection.execute(
+            """
+            SELECT id, name
+            FROM shops
+            WHERE id = ?
+              AND is_active = 1
+              AND is_customer_visible = 1
+            """,
+            (shop_id,),
+        ).fetchone()
+
+    if shop is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Active shop not found.",
+        )
+
+    return _evaluate_inventory_for_shop(
+        order,
+        dict(shop),
+        lambda search_name: find_inventory(shop_id, search_name),
+    )
 
 
 @app.post("/inventory/check")
@@ -460,6 +487,193 @@ async def check_inventory(
         shop_id=shop_id,
     )
 
+
+
+@app.post("/inventory/compare")
+async def compare_inventory_across_shops(
+    payload: dict = Body(
+        ...,
+        description="Grocery order to compare against customer-visible shops."
+    ),
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Compare a grocery order against all active, customer-visible shops.
+
+    Loads shop inventory and aliases in one database query.
+    Does not reserve stock or place an order.
+    """
+
+    authenticate_api_key(api_key)
+
+    try:
+        order = GroceryOrder.model_validate(payload)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid inventory comparison request.",
+        ) from exc
+
+    empty_response = {
+        "shop_count": 0,
+        "checked_count": 0,
+        "full_matches": [],
+        "partial_matches": [],
+        "failed": [],
+    }
+
+    if order.needs_clarification:
+        return {
+            **empty_response,
+            "status": "needs_clarification",
+            "message": "Clarify the grocery request before comparing shops.",
+        }
+
+    if not order.items:
+        raise HTTPException(
+            status_code=400,
+            detail="The grocery order must contain at least one item.",
+        )
+
+    # One database query loads all visible shops, products, inventory,
+    # reserved stock and alternate product names.
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                s.id AS shop_id,
+                s.name AS shop_name,
+                p.id AS product_id,
+                p.name AS product_name,
+                p.normalized_name,
+                p.brand,
+                p.variant,
+                p.base_unit,
+                i.price_per_unit,
+                i.stock_quantity,
+                i.reserved_quantity,
+                i.is_available,
+                pa.normalized_alias
+            FROM shops s
+            LEFT JOIN inventory i
+                ON i.shop_id = s.id
+            LEFT JOIN products p
+                ON p.id = i.product_id
+            LEFT JOIN product_aliases pa
+                ON pa.product_id = p.id
+            WHERE s.is_active = 1
+              AND s.is_customer_visible = 1
+            ORDER BY s.id, p.id
+            """
+        ).fetchall()
+
+    shops = {}
+
+    for row in rows:
+        shop_id = row["shop_id"]
+
+        if shop_id not in shops:
+            shops[shop_id] = {
+                "shop": {
+                    "id": shop_id,
+                    "name": row["shop_name"],
+                },
+                "canonical": {},
+                "aliases": {},
+            }
+
+        if row["product_id"] is None:
+            continue
+
+        product_id = row["product_id"]
+
+        candidate = {
+            "product_id": product_id,
+            "name": row["product_name"],
+            "brand": row["brand"],
+            "variant": row["variant"],
+            "base_unit": row["base_unit"],
+            "price_per_unit": row["price_per_unit"],
+            "stock_quantity": row["stock_quantity"],
+            "reserved_quantity": row["reserved_quantity"],
+            "is_available": bool(row["is_available"]),
+        }
+
+        canonical_name = (
+            row["normalized_name"] or ""
+        ).strip().casefold()
+
+        if canonical_name:
+            shops[shop_id]["canonical"].setdefault(
+                canonical_name, {}
+            )[product_id] = candidate
+
+        alias = row["normalized_alias"]
+
+        if alias:
+            normalized_alias = alias.strip().casefold()
+            if normalized_alias:
+                shops[shop_id]["aliases"].setdefault(
+                    normalized_alias, {}
+                )[product_id] = candidate
+
+    full_matches = []
+    partial_matches = []
+
+    for shop_id, data in shops.items():
+        canonical = data["canonical"]
+        aliases = data["aliases"]
+
+        def find_preloaded_matches(search_name):
+            key = search_name.strip().casefold()
+
+            # Preserve existing matching precedence:
+            # canonical names first, aliases only when no canonical match.
+            canonical_matches = list(canonical.get(key, {}).values())
+
+            if canonical_matches:
+                return canonical_matches
+
+            return list(aliases.get(key, {}).values())
+
+        result = _evaluate_inventory_for_shop(
+            order,
+            data["shop"],
+            find_preloaded_matches,
+        )
+
+        item_results = result.get("items", [])
+        matched_count = sum(
+            1
+            for item in item_results
+            if item.get("status") == "matched"
+        )
+
+        shop_result = {
+            "shop_id": shop_id,
+            "shop_name": data["shop"]["name"],
+            "matched_count": matched_count,
+            "total_items": len(order.items),
+            "items": item_results,
+            "status": result.get("status"),
+        }
+
+        if result.get("status") == "inventory_checked":
+            shop_result["total_rupees"] = float(result["total_rupees"])
+            full_matches.append(shop_result)
+        else:
+            partial_matches.append(shop_result)
+
+    full_matches.sort(key=lambda item: item["total_rupees"])
+
+    return {
+        "status": "completed",
+        "shop_count": len(shops),
+        "checked_count": len(shops),
+        "full_matches": full_matches,
+        "partial_matches": partial_matches,
+        "failed": [],
+    }
 
 
 def _order_request_fingerprint(order: GroceryOrder) -> str:
@@ -1434,8 +1648,8 @@ def admin_create_shop(
         with connection:
             shop_id = connection.insert_returning_id(
                 """
-                INSERT INTO shops (name)
-                VALUES (?)
+                INSERT INTO shops (name, is_customer_visible)
+                VALUES (?, 0)
                 """,
                 (payload.name,),
             )
@@ -1543,6 +1757,102 @@ def admin_create_shop_owner(
         "shop_id": payload.shop_id,
         "shop_name": shop["name"],
         "role": payload.role,
+    }
+
+
+@app.put("/admin/shops/{shop_id}/visibility")
+def admin_set_shop_visibility(
+    shop_id: int,
+    payload: AdminSetShopVisibilityRequest,
+    admin_token: str | None = Header(
+        default=None,
+        alias="X-Admin-Token",
+    ),
+):
+    """Publish or hide a shop in the customer-facing directory."""
+
+    authenticate_admin_token(admin_token)
+
+    with get_connection() as connection:
+        with connection:
+            shop = connection.execute(
+                """
+                SELECT id, name, is_active
+                FROM shops
+                WHERE id = ?
+                """,
+                (shop_id,),
+            ).fetchone()
+
+            if shop is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Shop not found.",
+                )
+
+            if payload.is_customer_visible:
+                if not shop["is_active"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="An inactive shop cannot be published.",
+                    )
+
+                active_member = connection.execute(
+                    """
+                    SELECT 1
+                    FROM shop_memberships sm
+                    JOIN users u ON u.id = sm.user_id
+                    WHERE sm.shop_id = ?
+                      AND sm.is_active = 1
+                      AND u.is_active = 1
+                    LIMIT 1
+                    """,
+                    (shop_id,),
+                ).fetchone()
+
+                if active_member is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Assign an active shop owner or manager "
+                            "before publishing this shop."
+                        ),
+                    )
+
+                available_inventory = connection.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM inventory
+                    WHERE shop_id = ?
+                      AND is_available = 1
+                      AND stock_quantity > COALESCE(reserved_quantity, 0)
+                    """,
+                    (shop_id,),
+                ).fetchone()
+
+                if available_inventory["total"] < 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Add at least one available inventory item "
+                            "before publishing this shop."
+                        ),
+                    )
+
+            connection.execute(
+                """
+                UPDATE shops
+                SET is_customer_visible = ?
+                WHERE id = ?
+                """,
+                (int(payload.is_customer_visible), shop_id),
+            )
+
+    return {
+        "status": "updated",
+        "shop_id": shop_id,
+        "shop_name": shop["name"],
+        "is_customer_visible": payload.is_customer_visible,
     }
 
 

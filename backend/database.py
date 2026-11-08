@@ -367,6 +367,49 @@ def _migrate_postgres_orders_schema():
             )
 
 
+def _migrate_customer_visibility_schema():
+    """Add a safe, opt-in customer visibility flag to shops."""
+
+    with get_connection() as connection:
+        if DATABASE_URL:
+            column = connection.execute(
+                """
+                SELECT 1 AS present
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'shops'
+                  AND column_name = 'is_customer_visible'
+                """
+            ).fetchone()
+
+            if column is None:
+                connection.execute(
+                    """
+                    ALTER TABLE shops
+                    ADD COLUMN is_customer_visible INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (is_customer_visible IN (0, 1))
+                    """
+                )
+        else:
+            columns = connection.execute(
+                "PRAGMA table_info(shops)"
+            ).fetchall()
+
+            if not any(
+                row["name"] == "is_customer_visible"
+                for row in columns
+            ):
+                connection.execute(
+                    """
+                    ALTER TABLE shops
+                    ADD COLUMN is_customer_visible INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (is_customer_visible IN (0, 1))
+                    """
+                )
+
+
 def _migrate_inventory_reservations_schema():
     """Add reserved stock tracking to existing SQLite/PostgreSQL databases."""
     with get_connection() as connection:
@@ -468,6 +511,8 @@ def initialize_database():
         name TEXT NOT NULL,
         is_active INTEGER NOT NULL DEFAULT 1
             CHECK (is_active IN (0, 1)),
+        is_customer_visible INTEGER NOT NULL DEFAULT 0
+            CHECK (is_customer_visible IN (0, 1)),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -743,6 +788,8 @@ def initialize_database():
                 connection.execute(statement)
 
     # Upgrade existing databases after creating any missing tables.
+    _migrate_customer_visibility_schema()
+
     if DATABASE_URL:
         _migrate_postgres_orders_schema()
     else:

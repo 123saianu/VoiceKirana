@@ -33,6 +33,12 @@ class AdminCreateShopRequest(BaseModel):
         return value
 
 
+class AdminSetShopVisibilityRequest(BaseModel):
+    """Administrator-controlled customer visibility."""
+
+    is_customer_visible: bool
+
+
 class AdminCreateShopOwnerRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     full_name: str = Field(min_length=1, max_length=150)

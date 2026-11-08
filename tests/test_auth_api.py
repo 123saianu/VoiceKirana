@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from backend import database
 from backend.auth_dependencies import authorize_shop_access
 from backend.main import app
+from backend.services.inventory_service import create_product, set_inventory
 
 
 ADMIN_TOKEN = "test-admin-token-for-voicekirana"
@@ -316,3 +317,75 @@ def test_manager_cannot_perform_owner_only_operation():
     assert exc.value.status_code == 403
 
     print("PASS: Manager restricted from owner-only operation")
+
+
+def test_new_shop_is_hidden_until_admin_approves_it(client):
+    shop_id = create_shop(client, "Visibility Workflow Test Shop")
+
+    directory = client.get("/shops")
+    assert directory.status_code == 200
+    assert shop_id not in {
+        shop["shop_id"] for shop in directory.json()["shops"]
+    }
+
+    hidden_catalogue = client.get(
+        f"/shops/{shop_id}/catalogue"
+    )
+    assert hidden_catalogue.status_code == 404
+
+    blocked_without_owner = client.put(
+        f"/admin/shops/{shop_id}/visibility",
+        headers={"X-Admin-Token": ADMIN_TOKEN},
+        json={"is_customer_visible": True},
+    )
+    assert blocked_without_owner.status_code == 409
+
+    owner = create_owner(
+        client,
+        shop_id,
+        email="visibility-owner@example.com",
+    )
+    assert owner["shop_id"] == shop_id
+
+    blocked_without_inventory = client.put(
+        f"/admin/shops/{shop_id}/visibility",
+        headers={"X-Admin-Token": ADMIN_TOKEN},
+        json={"is_customer_visible": True},
+    )
+    assert blocked_without_inventory.status_code == 409
+
+    product_id = create_product("Rice", "kg")
+    set_inventory(
+        shop_id=shop_id,
+        product_id=product_id,
+        price_paise=6500,
+        stock_quantity=10,
+    )
+
+    published = client.put(
+        f"/admin/shops/{shop_id}/visibility",
+        headers={"X-Admin-Token": ADMIN_TOKEN},
+        json={"is_customer_visible": True},
+    )
+
+    assert published.status_code == 200
+    assert published.json()["is_customer_visible"] is True
+
+    directory = client.get("/shops")
+    assert shop_id in {
+        shop["shop_id"] for shop in directory.json()["shops"]
+    }
+
+    hidden_again = client.put(
+        f"/admin/shops/{shop_id}/visibility",
+        headers={"X-Admin-Token": ADMIN_TOKEN},
+        json={"is_customer_visible": False},
+    )
+
+    assert hidden_again.status_code == 200
+    assert hidden_again.json()["is_customer_visible"] is False
+
+    directory = client.get("/shops")
+    assert shop_id not in {
+        shop["shop_id"] for shop in directory.json()["shops"]
+    }

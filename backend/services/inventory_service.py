@@ -9,7 +9,7 @@ def create_shop(name: str) -> int:
 
     with get_connection() as connection:
         return connection.insert_returning_id(
-            "INSERT INTO shops (name) VALUES (?)",
+            "INSERT INTO shops (name, is_customer_visible) VALUES (?, 1)",
             (name,),
         )
 

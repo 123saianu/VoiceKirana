@@ -1,5 +1,4 @@
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import sys
 import tempfile
@@ -1559,197 +1558,123 @@ if find_shops_clicked:
                     )
 
                 else:
-                    shops = fetch_active_shops(backend_url)
+                    # Keep the result safe when the backend request fails.
+                    comparison = None
 
-                    comparison = {
-                        "full_matches": [],
-                        "partial_matches": [],
-                        "failed": [],
-                        "checked_count": 0,
-                        "shop_count": len(shops),
-                        "signature": current_signature,
-                    }
+                    # Compare against every customer-visible shop with one
+                    # backend request instead of one request per shop.
+                    with st.spinner(
+                        "Comparing your cart across customer-visible shops..."
+                    ):
+                        response = requests.post(
+                            f"{backend_url}/inventory/compare",
+                            json=current_order_payload,
+                            headers={"X-API-Key": api_token},
+                            timeout=(5, 30),
+                        )
 
-                    if not shops:
-                        st.info("No active shops are available to compare.")
+                    if not response.ok:
+                        try:
+                            detail = response.json().get(
+                                "detail",
+                                "Bulk inventory comparison failed.",
+                            )
+                        except ValueError:
+                            detail = (
+                                "The backend returned an invalid response."
+                            )
+
+                        st.error(
+                            f"Inventory comparison failed "
+                            f"({response.status_code}): {detail}"
+                        )
 
                     else:
-                        def check_one_shop(shop):
-                            """Check one shop without touching Streamlit state."""
-                            try:
-                                shop_id_for_check = int(shop["shop_id"])
-                                shop_name_for_check = str(shop["shop_name"])
+                        result = response.json()
 
-                                response = requests.post(
-                                    f"{backend_url}/inventory/check",
-                                    params={"shop_id": shop_id_for_check},
-                                    json=current_order_payload,
-                                    headers={"X-API-Key": api_token},
-                                    timeout=(3, 5),
+                        if not isinstance(result, dict):
+                            raise ValueError(
+                                "Invalid bulk comparison response format."
+                            )
+
+                        comparison = {
+                            "full_matches": [],
+                            "partial_matches": [],
+                            "failed": [],
+                            "checked_count": 0,
+                            "shop_count": 0,
+                            "signature": current_signature,
+                        }
+
+                        result_status = result.get("status")
+
+                        if result_status == "needs_clarification":
+                            st.warning(
+                                result.get(
+                                    "message",
+                                    "Clarify the grocery request before "
+                                    "comparing shops.",
                                 )
+                            )
 
-                                if not response.ok:
-                                    try:
-                                        detail = response.json().get(
-                                            "detail",
-                                            "Inventory check failed.",
-                                        )
-                                    except ValueError:
-                                        detail = (
-                                            "The backend returned an invalid "
-                                            "response."
-                                        )
+                        elif result_status != "completed":
+                            raise ValueError(
+                                "The backend returned an unexpected "
+                                "comparison status."
+                            )
 
-                                    return "failed", {
-                                        "shop_id": shop_id_for_check,
-                                        "shop_name": shop_name_for_check,
-                                        "error": str(detail),
-                                    }
+                        else:
+                            for field in (
+                                "full_matches",
+                                "partial_matches",
+                                "failed",
+                            ):
+                                values = result.get(field, [])
 
-                                result = response.json()
-
-                                if not isinstance(result, dict):
-                                    raise ValueError(
-                                        "Invalid inventory response format."
+                                if (
+                                    not isinstance(values, list)
+                                    or not all(
+                                        isinstance(item, dict)
+                                        for item in values
                                     )
-
-                                item_results = result.get("items", [])
-
-                                if not isinstance(item_results, list):
-                                    raise ValueError(
-                                        "Invalid item-result format."
-                                    )
-
-                                if not all(
-                                    isinstance(item_result, dict)
-                                    for item_result in item_results
                                 ):
                                     raise ValueError(
-                                        "An inventory item result was invalid."
+                                        f"Invalid '{field}' in comparison "
+                                        "response."
                                     )
 
-                                matched_count = sum(
-                                    1
-                                    for item_result in item_results
-                                    if item_result.get("status") == "matched"
+                                comparison[field] = values
+
+                            shop_count = result.get("shop_count")
+                            checked_count = result.get("checked_count")
+
+                            if (
+                                not isinstance(shop_count, int)
+                                or not isinstance(checked_count, int)
+                                or shop_count < 0
+                                or checked_count < 0
+                            ):
+                                raise ValueError(
+                                    "Invalid shop counts in comparison "
+                                    "response."
                                 )
 
-                                total_items = len(
-                                    current_order_payload["items"]
+                            comparison["shop_count"] = shop_count
+                            comparison["checked_count"] = checked_count
+
+                            # Keep cheapest complete-cart match first.
+                            comparison["full_matches"].sort(
+                                key=lambda item: float(
+                                    item["total_rupees"]
+                                )
+                            )
+
+                            if shop_count == 0:
+                                st.info(
+                                    "No customer-visible shops are "
+                                    "currently available to compare."
                                 )
 
-                                shop_result = {
-                                    "shop_id": shop_id_for_check,
-                                    "shop_name": shop_name_for_check,
-                                    "matched_count": matched_count,
-                                    "total_items": total_items,
-                                    "items": item_results,
-                                    "status": result.get("status"),
-                                }
-
-                                is_full_match = (
-                                    result.get("status") == "inventory_checked"
-                                    and len(item_results) == total_items
-                                    and matched_count == total_items
-                                )
-
-                                if is_full_match:
-                                    shop_result["total_rupees"] = float(
-                                        result["total_rupees"]
-                                    )
-                                    return "full", shop_result
-
-                                return "partial", shop_result
-
-                            except (
-                                KeyError,
-                                TypeError,
-                                ValueError,
-                                requests.RequestException,
-                            ) as exc:
-                                return "failed", {
-                                    "shop_id": shop.get("shop_id"),
-                                    "shop_name": shop.get(
-                                        "shop_name", "Unknown shop"
-                                    ),
-                                    "error": str(exc),
-                                }
-
-                        progress_bar = st.progress(
-                            0,
-                            text=f"Preparing to check {len(shops)} shops...",
-                        )
-                        progress_status = st.empty()
-
-                        # Limit concurrency to avoid overwhelming the API/database.
-                        max_workers = min(12, len(shops))
-
-                        with ThreadPoolExecutor(
-                            max_workers=max_workers
-                        ) as executor:
-                            futures = {
-                                executor.submit(check_one_shop, shop): shop
-                                for shop in shops
-                            }
-
-                            completed_count = 0
-
-                            for future in as_completed(futures):
-                                completed_count += 1
-
-                                try:
-                                    category, shop_result = future.result()
-
-                                    if category == "full":
-                                        comparison["full_matches"].append(
-                                            shop_result
-                                        )
-                                        comparison["checked_count"] += 1
-
-                                    elif category == "partial":
-                                        comparison["partial_matches"].append(
-                                            shop_result
-                                        )
-                                        comparison["checked_count"] += 1
-
-                                    else:
-                                        comparison["failed"].append(
-                                            shop_result
-                                        )
-
-                                except Exception as exc:
-                                    shop = futures[future]
-                                    comparison["failed"].append({
-                                        "shop_id": shop.get("shop_id"),
-                                        "shop_name": shop.get(
-                                            "shop_name", "Unknown shop"
-                                        ),
-                                        "error": str(exc),
-                                    })
-
-                                progress_bar.progress(
-                                    completed_count / len(shops),
-                                    text=(
-                                        f"Checked {completed_count} "
-                                        f"of {len(shops)} shops"
-                                    ),
-                                )
-                                progress_status.caption(
-                                    f"{len(comparison['full_matches'])} "
-                                    "complete matches ? "
-                                    f"{len(comparison['partial_matches'])} "
-                                    "partial matches ? "
-                                    f"{len(comparison['failed'])} "
-                                    "could not be checked"
-                                )
-
-                        progress_bar.empty()
-                        progress_status.empty()
-
-                        # Rank complete matches by their complete-cart total.
-                        comparison["full_matches"].sort(
-                            key=lambda item: item["total_rupees"]
-                        )
 
                     st.session_state.shop_comparison_results = comparison
 
