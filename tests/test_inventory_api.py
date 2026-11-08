@@ -198,6 +198,198 @@ def test_bulk_inventory_comparison_requires_api_key(client):
     assert response.status_code == 401
 
 
+def test_public_catalogue_groups_same_product_and_keeps_shop_offers(
+    client,
+    stocked_shop,
+):
+    """Identical product identities share one group, not one shared price."""
+
+    second_shop = create_shop("Second Public Rice Shop")
+    second_rice_id = create_product("Rice", "kg")
+    set_inventory(
+        shop_id=second_shop,
+        product_id=second_rice_id,
+        price_paise=7000,
+        stock_quantity=10,
+    )
+
+    unavailable_shop = create_shop("Unavailable Rice Shop")
+    unavailable_rice_id = create_product("rice", "KG")
+    set_inventory(
+        shop_id=unavailable_shop,
+        product_id=unavailable_rice_id,
+        price_paise=6000,
+        stock_quantity=5,
+        is_available=False,
+    )
+
+    response = client.get("/catalogue/all")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    rice_groups = [
+        product
+        for product in body["products"]
+        if product["normalized_name"] == "rice"
+        and product["brand"] is None
+        and product["variant"] is None
+        and product["base_unit"].casefold() == "kg"
+    ]
+
+    assert len(rice_groups) == 1
+    rice = rice_groups[0]
+
+    assert rice["offer_count"] == 3
+    assert {
+        offer["shop_id"] for offer in rice["offers"]
+    } == {stocked_shop, second_shop, unavailable_shop}
+
+    offers_by_shop = {
+        offer["shop_id"]: offer
+        for offer in rice["offers"]
+    }
+
+    assert offers_by_shop[stocked_shop]["price_rupees"] == 65.0
+    assert offers_by_shop[second_shop]["price_rupees"] == 70.0
+    assert offers_by_shop[unavailable_shop]["is_available"] is False
+
+    assert body["shop_count"] == 3
+
+
+def test_public_catalogue_keeps_brand_variant_and_unit_distinct(
+    client,
+    stocked_shop,
+):
+    brand_rice_id = create_product(
+        "Rice",
+        "kg",
+        brand="Brand A",
+    )
+    set_inventory(
+        shop_id=stocked_shop,
+        product_id=brand_rice_id,
+        price_paise=8000,
+        stock_quantity=10,
+    )
+
+    variant_rice_id = create_product(
+        "Rice",
+        "kg",
+        variant="Sona Masoori",
+    )
+    set_inventory(
+        shop_id=stocked_shop,
+        product_id=variant_rice_id,
+        price_paise=8500,
+        stock_quantity=10,
+    )
+
+    litre_rice_id = create_product("Rice", "litre")
+    set_inventory(
+        shop_id=stocked_shop,
+        product_id=litre_rice_id,
+        price_paise=9000,
+        stock_quantity=10,
+    )
+
+    response = client.get("/catalogue/all")
+
+    assert response.status_code == 200
+
+    rice_groups = [
+        product
+        for product in response.json()["products"]
+        if product["normalized_name"] == "rice"
+    ]
+
+    assert len(rice_groups) == 4
+
+    identities = {
+        (
+            product["brand"],
+            product["variant"],
+            product["base_unit"],
+        )
+        for product in rice_groups
+    }
+
+    assert identities == {
+        (None, None, "kg"),
+        ("Brand A", None, "kg"),
+        (None, "Sona Masoori", "kg"),
+        (None, None, "litre"),
+    }
+
+
+def test_public_catalogue_excludes_hidden_and_inactive_shops(
+    client,
+    stocked_shop,
+):
+    hidden_shop = create_shop("Hidden Catalogue Shop")
+    hidden_product_id = create_product("Hidden Wheat", "kg")
+    set_inventory(
+        shop_id=hidden_shop,
+        product_id=hidden_product_id,
+        price_paise=5000,
+        stock_quantity=10,
+    )
+
+    inactive_shop = create_shop("Inactive Catalogue Shop")
+    inactive_product_id = create_product("Inactive Sugar", "kg")
+    set_inventory(
+        shop_id=inactive_shop,
+        product_id=inactive_product_id,
+        price_paise=4500,
+        stock_quantity=10,
+    )
+
+    with database.get_connection() as connection:
+        connection.execute(
+            "UPDATE shops SET is_customer_visible = 0 WHERE id = ?",
+            (hidden_shop,),
+        )
+        connection.execute(
+            "UPDATE shops SET is_active = 0 WHERE id = ?",
+            (inactive_shop,),
+        )
+
+    response = client.get("/catalogue/all")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    names = {
+        product["normalized_name"]
+        for product in body["products"]
+    }
+
+    assert "rice" in names
+    assert "hidden wheat" not in names
+    assert "inactive sugar" not in names
+    assert body["shop_count"] == 1
+
+
+def test_public_catalogue_returns_empty_when_no_shops_are_visible(
+    client,
+    stocked_shop,
+):
+    with database.get_connection() as connection:
+        connection.execute(
+            "UPDATE shops SET is_customer_visible = 0 WHERE id = ?",
+            (stocked_shop,),
+        )
+
+    response = client.get("/catalogue/all")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 0,
+        "shop_count": 0,
+        "products": [],
+    }
+
+
 def test_inventory_check_rejects_missing_api_key(client, stocked_shop):
     response = client.post(
         f"/inventory/check?shop_id={stocked_shop}",

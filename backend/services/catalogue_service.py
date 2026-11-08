@@ -211,6 +211,119 @@ def get_shop_inventory(shop_id: int) -> list[dict]:
         ]
 
 
+
+def get_public_catalogue_across_shops() -> list[dict]:
+    """
+    Return products grouped across active, customer-visible shops.
+
+    Product identity is name + brand + variant + base unit.
+    Prices and availability remain separate for every shop offer.
+    Exact stock quantities are never returned.
+    """
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                s.id AS shop_id,
+                s.name AS shop_name,
+                p.id AS product_id,
+                p.name AS product_name,
+                p.normalized_name,
+                p.brand,
+                p.variant,
+                p.base_unit,
+                i.price_per_unit,
+                i.stock_quantity,
+                i.reserved_quantity,
+                i.is_available
+            FROM shops s
+            JOIN inventory i
+                ON i.shop_id = s.id
+            JOIN products p
+                ON p.id = i.product_id
+            WHERE s.is_active = 1
+              AND s.is_customer_visible = 1
+            ORDER BY
+                LOWER(p.normalized_name),
+                LOWER(COALESCE(p.brand, '')),
+                LOWER(COALESCE(p.variant, '')),
+                LOWER(p.base_unit),
+                LOWER(s.name),
+                s.id
+            """
+        ).fetchall()
+
+    grouped = {}
+
+    for row in rows:
+        normalized_name = (
+            row["normalized_name"] or row["product_name"]
+        ).strip().casefold()
+
+        normalized_brand = _normalize_optional(row["brand"]) or ""
+        normalized_variant = _normalize_optional(row["variant"]) or ""
+        normalized_unit = _normalize(row["base_unit"])
+
+        identity = (
+            normalized_name,
+            normalized_brand,
+            normalized_variant,
+            normalized_unit,
+        )
+
+        if identity not in grouped:
+            grouped[identity] = {
+                "name": row["product_name"],
+                "normalized_name": normalized_name,
+                "brand": row["brand"],
+                "variant": row["variant"],
+                "base_unit": row["base_unit"],
+                "offers": [],
+            }
+
+        stock_quantity = float(row["stock_quantity"] or 0)
+        reserved_quantity = float(row["reserved_quantity"] or 0)
+
+        is_available = (
+            bool(row["is_available"])
+            and stock_quantity > reserved_quantity
+        )
+
+        price_paise = int(row["price_per_unit"])
+
+        grouped[identity]["offers"].append({
+            "shop_id": row["shop_id"],
+            "shop_name": row["shop_name"],
+            "product_id": row["product_id"],
+            "price_rupees": round(price_paise / 100, 2),
+            "is_available": is_available,
+        })
+
+    products = list(grouped.values())
+
+    for product in products:
+        product["offers"].sort(
+            key=lambda offer: (
+                not offer["is_available"],
+                offer["price_rupees"],
+                offer["shop_name"].casefold(),
+                offer["shop_id"],
+            )
+        )
+        product["offer_count"] = len(product["offers"])
+
+    products.sort(
+        key=lambda product: (
+            product["normalized_name"],
+            (product["brand"] or "").casefold(),
+            (product["variant"] or "").casefold(),
+            product["base_unit"].casefold(),
+        )
+    )
+
+    return products
+
 def update_shop_inventory(
     shop_id: int,
     product_id: int,

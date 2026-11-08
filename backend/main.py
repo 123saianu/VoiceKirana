@@ -52,6 +52,7 @@ from backend.security import (
 )
 from backend.services.catalogue_service import (
     get_shop_inventory,
+    get_public_catalogue_across_shops,
     register_product_for_shop,
     update_shop_inventory,
     add_shop_product_alias,
@@ -182,6 +183,29 @@ def get_public_shop_catalogue(shop_id: int):
         "shop_id": shop_id,
         "count": len(items),
         "items": items,
+    }
+
+
+@app.get("/catalogue/all")
+def list_public_catalogue_across_shops():
+    """
+    List products across active, customer-visible shops.
+
+    Products are grouped by name, brand, variant and base unit.
+    Each shop retains its own price and availability.
+    """
+    products = get_public_catalogue_across_shops()
+
+    shop_ids = {
+        offer["shop_id"]
+        for product in products
+        for offer in product["offers"]
+    }
+
+    return {
+        "count": len(products),
+        "shop_count": len(shop_ids),
+        "products": products,
     }
 
 
