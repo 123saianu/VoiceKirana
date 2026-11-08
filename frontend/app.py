@@ -5,6 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 import uuid
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -1862,77 +1863,252 @@ if (
     )
 
 
-# Explicit order confirmation
+# Customer account access
+# ---------------------------------------------------------
+
+for _key, _default in (
+    ("customer_access_token", None),
+    ("customer_profile", None),
+    ("order_history_result", None),
+    ("order_lookup_result", None),
+    ("order_lookup_customer_id", None),
+):
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
+
+
+def _customer_error_detail(response, fallback):
+    try:
+        detail = response.json().get("detail", fallback)
+    except ValueError:
+        return fallback
+    if isinstance(detail, dict):
+        detail = detail.get("message", detail)
+    return str(detail)
+
+
+def _clear_customer_session():
+    st.session_state.customer_access_token = None
+    st.session_state.customer_profile = None
+    st.session_state.order_history_result = None
+    st.session_state.order_lookup_result = None
+    st.session_state.order_lookup_customer_id = None
+    st.session_state.saved_order_result = None
+
+
+st.divider()
+st.markdown("### Your customer account")
+st.caption(
+    "Browsing shops, viewing catalogues and building your cart do not require login. "
+    "Sign in only when you want to save or track your personal orders."
+)
+
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile")
+
+if customer_token and customer_profile:
+    with st.container(border=True):
+        account_col, signout_col = st.columns([4, 1])
+        with account_col:
+            st.success(
+                f"Signed in as {customer_profile.get('full_name', 'Customer')}"
+            )
+            st.caption(customer_profile.get("email", ""))
+        with signout_col:
+            st.write("")
+            if st.button("Sign out", key="customer_sign_out_button"):
+                _clear_customer_session()
+                st.rerun()
+else:
+    with st.container(border=True):
+        auth_mode = st.radio(
+            "Customer account",
+            options=("Sign in", "Create account"),
+            horizontal=True,
+            key="customer_auth_mode",
+        )
+
+        with st.form("customer_auth_form", clear_on_submit=True):
+            full_name = ""
+            if auth_mode == "Create account":
+                full_name = st.text_input(
+                    "Full name",
+                    max_chars=150,
+                    key="customer_signup_full_name",
+                ).strip()
+
+            customer_email = st.text_input(
+                "Email address",
+                key="customer_auth_email",
+            ).strip()
+            customer_password = st.text_input(
+                "Password",
+                type="password",
+                key="customer_auth_password",
+            )
+            auth_submitted = st.form_submit_button(
+                "Create account" if auth_mode == "Create account" else "Sign in",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if auth_submitted:
+            if not customer_email or not customer_password:
+                st.warning("Enter both your email address and password.")
+            elif auth_mode == "Create account" and not full_name:
+                st.warning("Enter your full name to create an account.")
+            elif auth_mode == "Create account" and len(customer_password) < 12:
+                st.warning("Your password must contain at least 12 characters.")
+            else:
+                try:
+                    with st.spinner("Authenticating your customer account..."):
+                        if auth_mode == "Create account":
+                            register_response = requests.post(
+                                f"{backend_url}/customers/register",
+                                json={
+                                    "full_name": full_name,
+                                    "email": customer_email,
+                                    "password": customer_password,
+                                },
+                                timeout=15,
+                            )
+
+                            if not register_response.ok:
+                                st.error(
+                                    "Account creation failed "
+                                    f"({register_response.status_code}): "
+                                    f"{_customer_error_detail(register_response, 'Could not create your account.')}"
+                                )
+                                register_response = None
+
+                        else:
+                            register_response = True
+
+                        if register_response:
+                            login_response = requests.post(
+                                f"{backend_url}/customers/login",
+                                json={
+                                    "email": customer_email,
+                                    "password": customer_password,
+                                },
+                                timeout=15,
+                            )
+
+                            if not login_response.ok:
+                                st.error(
+                                    "Sign-in failed "
+                                    f"({login_response.status_code}): "
+                                    f"{_customer_error_detail(login_response, 'Could not sign in.')}"
+                                )
+                            else:
+                                token_payload = login_response.json()
+                                access_token = token_payload.get("access_token")
+                                token_type = str(
+                                    token_payload.get("token_type", "bearer")
+                                ).lower()
+
+                                if not access_token or token_type != "bearer":
+                                    st.error(
+                                        "The authentication service returned an invalid customer token."
+                                    )
+                                else:
+                                    profile_response = requests.get(
+                                        f"{backend_url}/customers/me",
+                                        headers={
+                                            "Authorization": f"Bearer {access_token}"
+                                        },
+                                        timeout=15,
+                                    )
+
+                                    if not profile_response.ok:
+                                        st.error(
+                                            "Your credentials were accepted, but your customer profile "
+                                            f"could not be loaded ({profile_response.status_code}): "
+                                            f"{_customer_error_detail(profile_response, 'Profile request failed.')}"
+                                        )
+                                    else:
+                                        st.session_state.customer_access_token = access_token
+                                        st.session_state.customer_profile = profile_response.json()
+                                        st.session_state.order_history_result = None
+                                        st.session_state.order_lookup_result = None
+                                        st.session_state.order_lookup_customer_id = None
+                                        st.session_state.saved_order_result = None
+                                        st.success("Customer account is ready.")
+                                        st.rerun()
+
+                except requests.RequestException as exc:
+                    st.error(f"Could not connect to the customer account service: {exc}")
+
+
+# Explicit customer order confirmation
 # ---------------------------------------------------------
 
 st.markdown("### Confirm your order")
 st.caption(
-    "Review your validated grocery request before saving it."
+    "Review your validated grocery request before saving it to your customer account."
 )
 
 pending_payload = st.session_state.pending_order_payload
 pending_shop_id = st.session_state.pending_shop_id
+customer_token = st.session_state.get("customer_access_token")
 
 with st.container(border=True):
     if pending_payload and pending_shop_id:
         st.success("Inventory check passed. Your order is ready for confirmation.")
-
         st.warning(
-            "Nothing has been saved yet. Confirm below to save a pending "
-            "order request. Stock will not be reserved, and shop acceptance "
-            "is not guaranteed."
+            "Nothing has been saved yet. Confirm below to save a pending order request. "
+            "Stock will not be reserved, and shop acceptance is not guaranteed."
         )
+
+        if not customer_token:
+            st.info("Sign in or create a customer account above to save this order.")
 
         if st.button(
             "Confirm and save order",
             type="primary",
             use_container_width=True,
             key="confirm_and_save_order_button",
+            disabled=not bool(customer_token),
         ):
-            if not api_token:
-                st.error("VOICEKIRANA_API_TOKEN is missing from your .env file.")
-            else:
-                try:
-                    with st.spinner("Rechecking inventory and saving order..."):
-                        confirm_response = requests.post(
-                            f"{backend_url}/orders/confirm",
-                            params={"shop_id": pending_shop_id},
-                            json=pending_payload,
-                            headers={
-                                "X-API-Key": api_token,
-                                "Idempotency-Key": st.session_state.pending_idempotency_key,
-                            },
-                            timeout=20,
-                        )
+            try:
+                with st.spinner("Rechecking inventory and saving your order..."):
+                    confirm_response = requests.post(
+                        f"{backend_url}/customers/orders/confirm",
+                        params={"shop_id": int(pending_shop_id)},
+                        json=pending_payload,
+                        headers={
+                            "Authorization": f"Bearer {customer_token}",
+                            "Idempotency-Key": st.session_state.pending_idempotency_key,
+                        },
+                        timeout=20,
+                    )
 
-                    if confirm_response.ok:
-                        st.session_state.saved_order_result = confirm_response.json()
-                        st.session_state.pending_order_payload = None
-                        st.session_state.pending_shop_id = None
-                        st.session_state.pending_idempotency_key = None
-                        st.rerun()
-                    else:
-                        try:
-                            detail = confirm_response.json().get(
-                                "detail", "The order could not be saved."
-                            )
-                        except ValueError:
-                            detail = "The backend returned an invalid response."
+                if confirm_response.ok:
+                    st.session_state.saved_order_result = confirm_response.json()
+                    st.session_state.pending_order_payload = None
+                    st.session_state.pending_shop_id = None
+                    st.session_state.pending_idempotency_key = None
+                    st.session_state.order_history_result = None
+                    st.session_state.order_lookup_result = None
+                    st.session_state.order_lookup_customer_id = None
+                    st.rerun()
+                elif confirm_response.status_code == 401:
+                    _clear_customer_session()
+                    st.error("Your customer session expired. Please sign in again to save this order.")
+                else:
+                    st.error(
+                        f"Order was not saved ({confirm_response.status_code}): "
+                        f"{_customer_error_detail(confirm_response, 'The order could not be saved.')}"
+                    )
 
-                        st.error(
-                            f"Order was not saved ({confirm_response.status_code}): "
-                            f"{detail}"
-                        )
-
-                except requests.RequestException as exc:
-                    st.error(f"Could not connect to the backend: {exc}")
+            except requests.RequestException as exc:
+                st.error(f"Could not connect to the backend: {exc}")
 
     elif st.session_state.saved_order_result:
         saved = st.session_state.saved_order_result
         rupee = chr(0x20B9)
 
-        st.success("Your order request has been saved successfully.")
-
+        st.success("Your customer order request has been saved successfully.")
         reference_col, status_col = st.columns(2)
 
         with reference_col:
@@ -1947,7 +2123,6 @@ with st.container(border=True):
             "Saved order total",
             f"{rupee}{float(saved['total_rupees']):,.2f}",
         )
-
         st.info(
             "This is a saved pending order request. Stock is not reserved, "
             "and shop acceptance has not been confirmed."
@@ -1955,76 +2130,69 @@ with st.container(border=True):
 
     else:
         st.info(
-            "Your cart must pass inventory validation before an order "
-            "can be confirmed. The confirmation button will appear when "
-            "every requested item is eligible."
+            "Your cart must pass inventory validation before an order can be confirmed. "
+            "The confirmation button appears when every requested item is eligible."
         )
 
-
-
 # ---------------------------------------------------------
-# Saved order history
+# Customer order history
 # ---------------------------------------------------------
 
 st.markdown("### Your order history")
-st.caption(
-    "View saved grocery orders and track their current status."
-)
+st.caption("View the orders saved under your customer account, across shops.")
+
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile") or {}
 
 with st.container(border=True):
-    st.markdown("**Order records**")
-    st.write(
-        "Load the orders associated with the currently selected shop."
-    )
+    st.markdown("**Your saved orders**")
 
-    if st.button(
+    if not customer_token:
+        st.info("Sign in to your customer account to view your personal order history.")
+    elif st.button(
         "Load order history",
         key="load_order_history_button",
         use_container_width=True,
     ):
-        if not api_token:
-            st.error("VOICEKIRANA_API_TOKEN is missing from your .env file.")
-        else:
-            try:
-                with st.spinner("Loading saved orders..."):
-                    history_response = requests.get(
-                        f"{backend_url}/orders/history",
-                        params={"shop_id": int(shop_id)},
-                        headers={"X-API-Key": api_token},
-                        timeout=15,
-                    )
+        try:
+            with st.spinner("Loading your saved orders..."):
+                history_response = requests.get(
+                    f"{backend_url}/customers/orders",
+                    headers={"Authorization": f"Bearer {customer_token}"},
+                    timeout=15,
+                )
 
-                if history_response.ok:
-                    st.session_state.order_history_result = history_response.json()
-                else:
-                    try:
-                        detail = history_response.json().get(
-                            "detail", "Could not load order history."
-                        )
-                    except ValueError:
-                        detail = "The backend returned an invalid response."
+            if history_response.ok:
+                st.session_state.order_history_result = history_response.json()
+            elif history_response.status_code == 401:
+                _clear_customer_session()
+                st.error("Your customer session expired. Please sign in again.")
+            else:
+                st.error(
+                    f"History request failed ({history_response.status_code}): "
+                    f"{_customer_error_detail(history_response, 'Could not load your order history.')}"
+                )
 
-                    st.error(
-                        f"History request failed "
-                        f"({history_response.status_code}): {detail}"
-                    )
-
-            except requests.RequestException as exc:
-                st.error(f"Could not connect to the backend: {exc}")
+        except requests.RequestException as exc:
+            st.error(f"Could not connect to the backend: {exc}")
 
 history = st.session_state.get("order_history_result")
+customer_profile = st.session_state.get("customer_profile") or {}
+current_customer_id = customer_profile.get("customer_id")
 
-if history and history.get("shop_id") == int(shop_id):
+if (
+    history
+    and current_customer_id is not None
+    and history.get("customer_id") == current_customer_id
+):
     orders = history.get("orders", [])
 
     if not orders:
-        st.info("No saved orders found for this shop.")
+        st.info("You do not have any customer orders yet.")
     else:
-        st.caption(
-            f"{history['count']} saved order(s) for {history['shop_name']}"
-        )
-
+        st.caption(f"{history.get('count', len(orders))} order(s) in your account history")
         rupee = chr(0x20B9)
+        shop_name_by_id = dict(shop_options)
 
         history_status_labels = {
             "pending": "Pending - awaiting shop acceptance",
@@ -2036,24 +2204,22 @@ if history and history.get("shop_id") == int(shop_id):
         }
 
         for saved_order in orders:
-            status = str(
-                saved_order.get("status", "unknown")
-            ).lower()
-
+            status = str(saved_order.get("status", "unknown")).lower()
             status_label = history_status_labels.get(
                 status,
                 status.replace("_", " ").title(),
             )
+            order_shop_id = saved_order.get("shop_id")
+            shop_label = shop_name_by_id.get(
+                order_shop_id,
+                f"Shop #{order_shop_id}" if order_shop_id is not None else "Unknown shop",
+            )
 
             with st.container(border=True):
                 reference_col, status_col = st.columns([3, 2])
-
                 with reference_col:
                     st.caption("ORDER REFERENCE")
-                    st.markdown(
-                        f"**{saved_order['order_reference']}**"
-                    )
-
+                    st.markdown(f"**{saved_order.get('order_reference', 'Unknown')}**")
                 with status_col:
                     st.caption("ORDER STATUS")
                     if status == "pending":
@@ -2065,242 +2231,168 @@ if history and history.get("shop_id") == int(shop_id):
                     else:
                         st.info(status_label)
 
-                total = float(saved_order["total_rupees"])
-
+                st.caption(f"Shop: {shop_label}")
                 st.metric(
                     "Order total",
-                    f"{rupee}{total:,.2f}",
+                    f"{rupee}{float(saved_order.get('total_rupees', 0)):,.2f}",
                 )
-
-                st.caption(
-                    f"Created: {saved_order['created_at']}"
-                )
+                st.caption(f"Created: {saved_order.get('created_at', 'Unknown')}")
 
                 with st.expander("View ordered products"):
-                    for saved_item in saved_order["items"]:
-                        product_label = saved_item["product_name"]
-
+                    for saved_item in saved_order.get("items", []):
+                        product_label = saved_item.get("product_name", "Unknown product")
                         if saved_item.get("brand"):
                             product_label += f" ({saved_item['brand']})"
-
                         if saved_item.get("variant"):
                             product_label += f" - {saved_item['variant']}"
 
+                        unit_price = float(saved_item.get("unit_price_paise", 0)) / 100
+                        line_total = float(saved_item.get("line_total_paise", 0)) / 100
                         st.write(
-                            f"{product_label}: {saved_item['quantity']} "
-                            f"{saved_item['unit']} x "
-                            f"{rupee}{saved_item['unit_price_paise'] / 100:.2f} = "
-                            f"{rupee}{saved_item['line_total_paise'] / 100:.2f}"
+                            f"{product_label}: {saved_item.get('quantity', '?')} "
+                            f"{saved_item.get('unit', '')} x {rupee}{unit_price:.2f} = "
+                            f"{rupee}{line_total:.2f}"
                         )
 
-
-
 # ---------------------------------------------------------
-# Order lookup and cancellation
+# Customer order lookup
 # ---------------------------------------------------------
 
-st.markdown("### Find or cancel an order")
+st.markdown("### Track an order")
 st.caption(
-    "Track a grocery order using its reference. "
-    "Only pending orders can be cancelled."
+    "Look up an order saved under your signed-in customer account. "
+    "Order cancellation is currently handled by the shop."
 )
 
-if "order_lookup_result" not in st.session_state:
-    st.session_state.order_lookup_result = None
-
-if "order_lookup_shop_id" not in st.session_state:
-    st.session_state.order_lookup_shop_id = None
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile") or {}
+current_customer_id = customer_profile.get("customer_id")
 
 with st.container(border=True):
     st.markdown("**Track your order**")
-    st.write(
-        "Enter the order reference you received when your order was saved."
-    )
 
-    reference_col, lookup_col = st.columns([3, 1])
+    if not customer_token:
+        st.info("Sign in to your customer account to look up an order.")
+        order_reference_input = ""
+        lookup_clicked = False
+    else:
+        st.write("Enter the order reference you received when your order was saved.")
+        reference_col, lookup_col = st.columns([3, 1])
 
-    with reference_col:
-        order_reference_input = st.text_input(
-            "Order reference",
-            placeholder="e.g. VK-EB505AA5BFA7",
-            key="order_lookup_reference_input",
-        ).strip()
+        with reference_col:
+            order_reference_input = st.text_input(
+                "Order reference",
+                placeholder="e.g. VK-EB505AA5BFA7",
+                key="order_lookup_reference_input",
+            ).strip()
 
-    with lookup_col:
-        st.write("")
-        lookup_clicked = st.button(
-            "Look up order",
-            key="lookup_order_button",
-            use_container_width=True,
-        )
+        with lookup_col:
+            st.write("")
+            lookup_clicked = st.button(
+                "Look up order",
+                key="lookup_order_button",
+                use_container_width=True,
+            )
 
 if lookup_clicked:
     st.session_state.order_lookup_result = None
-    st.session_state.order_lookup_shop_id = None
+    st.session_state.order_lookup_customer_id = None
 
-    if not api_token:
-        st.error("VOICEKIRANA_API_TOKEN is missing from your .env file.")
-    elif not order_reference_input:
+    if not order_reference_input:
         st.warning("Enter an order reference first.")
     else:
         try:
-            with st.spinner("Looking up order..."):
+            with st.spinner("Looking up your order..."):
                 lookup_response = requests.get(
-                    f"{backend_url}/orders/{order_reference_input}",
-                    params={"shop_id": int(shop_id)},
-                    headers={"X-API-Key": api_token},
+                    f"{backend_url}/customers/orders/{quote(order_reference_input, safe='')}",
+                    headers={"Authorization": f"Bearer {customer_token}"},
                     timeout=15,
                 )
 
             if lookup_response.ok:
                 st.session_state.order_lookup_result = lookup_response.json()
-                st.session_state.order_lookup_shop_id = int(shop_id)
-            else:
-                try:
-                    detail = lookup_response.json().get(
-                        "detail", "Could not find the order."
-                    )
-                except ValueError:
-                    detail = "The backend returned an invalid response."
-
+                st.session_state.order_lookup_customer_id = current_customer_id
+            elif lookup_response.status_code == 401:
+                _clear_customer_session()
+                st.error("Your customer session expired. Please sign in again.")
+            elif lookup_response.status_code == 404:
                 st.error(
-                    f"Order lookup failed "
-                    f"({lookup_response.status_code}): {detail}"
+                    "This order is not linked to the signed-in customer account. "
+                    "It may have been saved before customer sign-in was introduced, "
+                    "or it may belong to another customer."
+                )
+            else:
+                st.error(
+                    f"Order lookup failed ({lookup_response.status_code}): "
+                    f"{_customer_error_detail(lookup_response, 'Could not find your order.')}"
                 )
 
         except requests.RequestException as exc:
             st.error(f"Could not connect to the backend: {exc}")
 
 lookup_result = st.session_state.get("order_lookup_result")
-lookup_result_shop_id = st.session_state.get("order_lookup_shop_id")
+lookup_customer_id = st.session_state.get("order_lookup_customer_id")
 
-if lookup_result and lookup_result_shop_id == int(shop_id):
+if (
+    lookup_result
+    and current_customer_id is not None
+    and lookup_customer_id == current_customer_id
+):
     status = str(lookup_result.get("status", "unknown"))
     status_normalized = status.lower()
     rupee = chr(0x20B9)
 
     with st.container(border=True):
         st.markdown("**Order details**")
-
         reference_col, status_col = st.columns([3, 2])
 
         with reference_col:
             st.caption("ORDER REFERENCE")
-            st.markdown(
-                f"**{lookup_result.get('order_reference', 'Unknown')}**"
-            )
+            st.markdown(f"**{lookup_result.get('order_reference', 'Unknown')}**")
 
         with status_col:
             st.caption("ORDER STATUS")
-
             if status_normalized == "pending":
                 st.warning("Pending - awaiting shop acceptance")
             elif status_normalized in ("confirmed", "accepted", "completed"):
                 st.success(status.replace("_", " ").title())
             elif status_normalized == "rejected":
-                st.error("Rejected")
+                st.error("Rejected by shop")
             else:
                 st.info(status.replace("_", " ").title())
 
-        st.caption(
-            f"Created: {lookup_result.get('created_at', 'Unknown')}"
-        )
-
+        st.caption(f"Created: {lookup_result.get('created_at', 'Unknown')}")
         st.metric(
             "Order total",
             f"{rupee}{float(lookup_result.get('total_rupees', 0)):,.2f}",
         )
 
+        if lookup_result.get("rejection_reason"):
+            st.warning(f"Shop response: {lookup_result['rejection_reason']}")
+
         with st.expander("View ordered products", expanded=True):
             for saved_item in lookup_result.get("items", []):
-                product_label = saved_item.get(
-                    "product_name", "Unknown product"
-                )
-
+                product_label = saved_item.get("product_name", "Unknown product")
                 if saved_item.get("brand"):
                     product_label += f" ({saved_item['brand']})"
-
                 if saved_item.get("variant"):
                     product_label += f" - {saved_item['variant']}"
 
                 quantity = saved_item.get("quantity", "?")
                 unit = saved_item.get("unit", "")
-
-                unit_price = saved_item.get(
-                    "unit_price_rupees",
-                    saved_item.get("unit_price_paise", 0) / 100,
-                )
-
-                line_total = saved_item.get(
-                    "line_total_rupees",
-                    saved_item.get("line_total_paise", 0) / 100,
-                )
-
+                unit_price = float(saved_item.get("unit_price_paise", 0)) / 100
+                line_total = float(saved_item.get("line_total_paise", 0)) / 100
                 st.write(
                     f"{product_label}: {quantity} {unit} x "
                     f"{rupee}{unit_price:.2f} = {rupee}{line_total:.2f}"
                 )
 
         if status_normalized == "pending":
-            st.warning(
-                "This order is pending. Cancelling changes its status; "
-                "it does not reserve or return inventory."
-            )
-
-            if st.button(
-                "Cancel pending order",
-                type="secondary",
-                key="cancel_pending_order_button",
-                use_container_width=True,
-            ):
-                if not api_token:
-                    st.error(
-                        "VOICEKIRANA_API_TOKEN is missing from your .env file."
-                    )
-                else:
-                    reference = lookup_result.get("order_reference", "")
-
-                    try:
-                        with st.spinner("Cancelling pending order..."):
-                            cancel_response = requests.post(
-                                f"{backend_url}/orders/{reference}/cancel",
-                                params={"shop_id": int(shop_id)},
-                                headers={"X-API-Key": api_token},
-                                timeout=15,
-                            )
-
-                        if cancel_response.ok:
-                            st.session_state.order_lookup_result = (
-                                cancel_response.json()
-                            )
-                            st.success("Order cancelled successfully.")
-                            st.rerun()
-                        else:
-                            try:
-                                detail = cancel_response.json().get(
-                                    "detail", "The order could not be cancelled."
-                                )
-                            except ValueError:
-                                detail = (
-                                    "The backend returned an invalid response."
-                                )
-
-                            st.error(
-                                f"Cancellation failed "
-                                f"({cancel_response.status_code}): {detail}"
-                            )
-
-                    except requests.RequestException as exc:
-                        st.error(f"Could not connect to the backend: {exc}")
-
-        elif status_normalized == "cancelled":
-            st.info("This order is already cancelled.")
-        else:
             st.info(
-                "This order is not pending, so cancellation is not available."
+                "Your order is waiting for shop acceptance. To request cancellation, "
+                "please contact the shop. Customer-side cancellation is not enabled yet."
             )
-
-elif lookup_result and lookup_result_shop_id != int(shop_id):
-    st.info(
-        "The selected shop changed. Look up the order again for this shop."
-    )
+        elif status_normalized == "cancelled":
+            st.info("This order has been cancelled.")
+        elif status_normalized == "rejected":
+            st.info("The shop rejected this order. Check the shop response above for details.")
