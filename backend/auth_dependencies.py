@@ -135,7 +135,8 @@ def get_current_customer(
     with get_connection() as connection:
         customer = connection.execute(
             """
-            SELECT id, email, full_name, is_active
+            SELECT
+                id, email, full_name, phone, preferred_language, is_active
             FROM customers
             WHERE id = ?
             """,
@@ -153,6 +154,8 @@ def get_current_customer(
         "customer_id": customer["id"],
         "email": customer["email"],
         "full_name": customer["full_name"],
+        "phone": customer["phone"],
+        "preferred_language": customer["preferred_language"] or "en-IN",
     }
 
 

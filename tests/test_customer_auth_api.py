@@ -248,3 +248,203 @@ def test_customer_registration_does_not_expose_password_hash(client):
     assert "password" not in data
 
     print("PASS: Customer credentials are not exposed")
+
+
+def _customer_auth_headers(client, email):
+    login = login_customer(client, email=email)
+    assert login.status_code == 200
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+
+def _address_payload(**overrides):
+    payload = {
+        "label": "Home",
+        "recipient_name": "Test Customer",
+        "phone": "+91 9876543210",
+        "address_line1": "12 Market Road",
+        "address_line2": "Near Bus Stop",
+        "landmark": "Opposite Park",
+        "city": "Hyderabad",
+        "state": "Telangana",
+        "postal_code": "500072",
+        "country": "India",
+        "is_default": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_customer_can_update_profile_without_changing_email(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+    response = client.patch(
+        "/customers/me",
+        headers=headers,
+        json={
+            "full_name": "Updated Customer",
+            "phone": "+91 9876543210",
+            "preferred_language": "te-IN",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["full_name"] == "Updated Customer"
+    assert data["email"] == "customer@example.com"
+    assert data["phone"] == "+91 9876543210"
+    assert data["preferred_language"] == "te-IN"
+    print("PASS: Customer can update editable profile fields")
+
+
+def test_customer_profile_patch_requires_at_least_one_field(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+    response = client.patch("/customers/me", headers=headers, json={})
+    assert response.status_code == 400
+    print("PASS: Empty profile update rejected")
+
+
+def test_customer_can_create_list_update_and_delete_addresses(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+    created = client.post(
+        "/customers/addresses", headers=headers, json=_address_payload()
+    )
+    assert created.status_code == 201
+    assert created.json()["is_default"] is True
+
+    second = client.post(
+        "/customers/addresses",
+        headers=headers,
+        json=_address_payload(
+            label="Work", address_line1="44 Office Road", is_default=False
+        ),
+    )
+    assert second.status_code == 201
+    second_id = second.json()["address_id"]
+    assert second.json()["is_default"] is False
+
+    listed = client.get("/customers/addresses", headers=headers)
+    assert listed.status_code == 200
+    assert len(listed.json()) == 2
+
+    updated = client.put(
+        f"/customers/addresses/{second_id}",
+        headers=headers,
+        json=_address_payload(
+            label="Work", address_line1="45 Updated Office Road", is_default=True
+        ),
+    )
+    assert updated.status_code == 200
+    assert updated.json()["address_line1"] == "45 Updated Office Road"
+    assert updated.json()["is_default"] is True
+    listed = client.get("/customers/addresses", headers=headers).json()
+    assert sum(bool(item["is_default"]) for item in listed) == 1
+
+    deleted = client.delete(
+        f"/customers/addresses/{second_id}", headers=headers
+    )
+    assert deleted.status_code == 200
+    remaining = client.get("/customers/addresses", headers=headers).json()
+    assert len(remaining) == 1
+    assert remaining[0]["is_default"] is True
+    print("PASS: Customer address CRUD and default-address handling")
+
+
+def test_first_saved_address_becomes_default_automatically(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+    response = client.post(
+        "/customers/addresses",
+        headers=headers,
+        json=_address_payload(is_default=False),
+    )
+    assert response.status_code == 201
+    assert response.json()["is_default"] is True
+    print("PASS: First saved address automatically becomes default")
+
+
+def test_customer_cannot_access_another_customers_address(client):
+    register_customer(client, email="first@example.com")
+    first_headers = _customer_auth_headers(client, "first@example.com")
+    created = client.post(
+        "/customers/addresses", headers=first_headers, json=_address_payload()
+    )
+    address_id = created.json()["address_id"]
+
+    register_customer(client, email="second@example.com")
+    second_headers = _customer_auth_headers(client, "second@example.com")
+    update_response = client.put(
+        f"/customers/addresses/{address_id}",
+        headers=second_headers,
+        json=_address_payload(label="Hijack"),
+    )
+    delete_response = client.delete(
+        f"/customers/addresses/{address_id}", headers=second_headers
+    )
+    assert update_response.status_code == 404
+    assert delete_response.status_code == 404
+    first_list = client.get("/customers/addresses", headers=first_headers)
+    assert len(first_list.json()) == 1
+    assert first_list.json()[0]["label"] == "Home"
+    print("PASS: Customer address ownership is enforced")
+
+
+def test_customer_address_endpoints_require_authentication(client):
+    response = client.get("/customers/addresses")
+    assert response.status_code == 401
+    print("PASS: Saved addresses require customer authentication")
+
+
+def test_customer_profile_rejects_null_preferred_language(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+
+    response = client.patch(
+        "/customers/me",
+        headers=headers,
+        json={"preferred_language": None},
+    )
+
+    assert response.status_code == 422
+
+
+def test_editing_default_address_keeps_a_default_selected(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+
+    created = client.post(
+        "/customers/addresses",
+        headers=headers,
+        json=_address_payload(is_default=True),
+    )
+    assert created.status_code == 201
+    address_id = created.json()["address_id"]
+
+    updated = client.put(
+        f"/customers/addresses/{address_id}",
+        headers=headers,
+        json=_address_payload(
+            label="Home",
+            address_line1="13 Updated Market Road",
+            is_default=False,
+        ),
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["is_default"] is True
+
+    listed = client.get("/customers/addresses", headers=headers).json()
+    assert len(listed) == 1
+    assert listed[0]["is_default"] is True
+
+def test_customer_profile_rejects_null_full_name(client):
+    register_customer(client)
+    headers = _customer_auth_headers(client, "customer@example.com")
+
+    response = client.patch(
+        "/customers/me",
+        headers=headers,
+        json={"full_name": None},
+    )
+
+    assert response.status_code == 422

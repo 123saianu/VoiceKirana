@@ -502,6 +502,117 @@ def _migrate_payment_refunds_schema():
                 )
 
 
+
+def _migrate_customer_profile_schema():
+    """Add editable customer profile fields and customer-owned addresses."""
+
+    with get_connection() as connection:
+        if DATABASE_URL:
+            connection.execute(
+                "ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT"
+            )
+            connection.execute(
+                """
+                ALTER TABLE customers
+                ADD COLUMN IF NOT EXISTS preferred_language TEXT
+                NOT NULL DEFAULT 'en-IN'
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_addresses (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_id BIGINT NOT NULL,
+                    label TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    address_line1 TEXT NOT NULL,
+                    address_line2 TEXT,
+                    landmark TEXT,
+                    city TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    postal_code TEXT NOT NULL,
+                    country TEXT NOT NULL DEFAULT 'India',
+                    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (customer_id)
+                        REFERENCES customers(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_customer_addresses_customer
+                ON customer_addresses(customer_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_customer_addresses_one_default
+                ON customer_addresses(customer_id)
+                WHERE is_default = TRUE
+                """
+            )
+        else:
+            customer_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(customers)"
+                ).fetchall()
+            }
+            if "phone" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE customers ADD COLUMN phone TEXT"
+                )
+            if "preferred_language" not in customer_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE customers
+                    ADD COLUMN preferred_language TEXT NOT NULL DEFAULT 'en-IN'
+                    """
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    address_line1 TEXT NOT NULL,
+                    address_line2 TEXT,
+                    landmark TEXT,
+                    city TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    postal_code TEXT NOT NULL,
+                    country TEXT NOT NULL DEFAULT 'India',
+                    is_default INTEGER NOT NULL DEFAULT 0
+                        CHECK (is_default IN (0, 1)),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (customer_id)
+                        REFERENCES customers(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_customer_addresses_customer
+                ON customer_addresses(customer_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_customer_addresses_one_default
+                ON customer_addresses(customer_id)
+                WHERE is_default = 1
+                """
+            )
+
+
 def _migrate_customer_remember_sessions_schema():
     """Create revocable customer remember-me sessions."""
 
@@ -838,6 +949,7 @@ def initialize_database():
     # Upgrade existing databases after creating any missing tables.
     _migrate_customer_visibility_schema()
     _migrate_customer_remember_sessions_schema()
+    _migrate_customer_profile_schema()
 
     if DATABASE_URL:
         _migrate_postgres_orders_schema()

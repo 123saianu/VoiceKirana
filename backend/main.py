@@ -36,6 +36,9 @@ from backend.models.auth import (
 from backend.models.customer import (
     CustomerRegisterRequest,
     CustomerProfileResponse,
+    CustomerProfileUpdateRequest,
+    CustomerAddressRequest,
+    CustomerAddressResponse,
     CustomerLoginRequest,
     CustomerRememberRequest,
     CustomerLoginResponse,
@@ -2077,6 +2080,228 @@ def get_customer_profile(
     """Return the authenticated customer's profile."""
 
     return current_customer
+
+
+
+@app.patch(
+    "/customers/me",
+    response_model=CustomerProfileResponse,
+)
+def update_customer_profile(
+    payload: CustomerProfileUpdateRequest,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Update the authenticated customer's editable profile fields."""
+
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one profile field to update.",
+        )
+    if "full_name" in updates and updates["full_name"] is None:
+        raise HTTPException(status_code=422, detail="Full name cannot be empty.")
+
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    parameters = list(updates.values()) + [current_customer["customer_id"]]
+    with get_connection() as connection:
+        connection.execute(
+            f"UPDATE customers SET {assignments} WHERE id = ?",
+            parameters,
+        )
+        customer = connection.execute(
+            """
+            SELECT id, full_name, email, phone, preferred_language
+            FROM customers
+            WHERE id = ?
+            """,
+            (current_customer["customer_id"],),
+        ).fetchone()
+
+    return {
+        "customer_id": customer["id"],
+        "full_name": customer["full_name"],
+        "email": customer["email"],
+        "phone": customer["phone"],
+        "preferred_language": customer["preferred_language"] or "en-IN",
+    }
+
+
+@app.get(
+    "/customers/addresses",
+    response_model=list[CustomerAddressResponse],
+)
+def list_customer_addresses(
+    current_customer: dict = Depends(get_current_customer),
+):
+    """List only the authenticated customer's saved addresses."""
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id AS address_id, label, recipient_name, phone,
+                address_line1, address_line2, landmark, city, state,
+                postal_code, country, is_default, created_at
+            FROM customer_addresses
+            WHERE customer_id = ?
+            ORDER BY is_default DESC, created_at DESC, id DESC
+            """,
+            (current_customer["customer_id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post(
+    "/customers/addresses",
+    response_model=CustomerAddressResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_customer_address(
+    payload: CustomerAddressRequest,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Create a saved address owned by the authenticated customer."""
+
+    customer_id = current_customer["customer_id"]
+    address = payload.model_dump()
+    with get_connection() as connection:
+        count_row = connection.execute(
+            "SELECT COUNT(*) AS address_count FROM customer_addresses WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone()
+        make_default = bool(address["is_default"]) or count_row["address_count"] == 0
+        if make_default:
+            connection.execute(
+                "UPDATE customer_addresses SET is_default = ? WHERE customer_id = ?",
+                (False, customer_id),
+            )
+
+        address_id = connection.insert_returning_id(
+            """
+            INSERT INTO customer_addresses (
+                customer_id, label, recipient_name, phone,
+                address_line1, address_line2, landmark, city, state,
+                postal_code, country, is_default
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                customer_id, address["label"], address["recipient_name"],
+                address["phone"], address["address_line1"],
+                address["address_line2"], address["landmark"],
+                address["city"], address["state"], address["postal_code"],
+                address["country"], make_default,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT
+                id AS address_id, label, recipient_name, phone,
+                address_line1, address_line2, landmark, city, state,
+                postal_code, country, is_default, created_at
+            FROM customer_addresses
+            WHERE id = ? AND customer_id = ?
+            """,
+            (address_id, customer_id),
+        ).fetchone()
+    return dict(row)
+
+
+@app.put(
+    "/customers/addresses/{address_id}",
+    response_model=CustomerAddressResponse,
+)
+def update_customer_address(
+    address_id: int,
+    payload: CustomerAddressRequest,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Replace one saved address, but only when it belongs to this customer."""
+
+    customer_id = current_customer["customer_id"]
+    address = payload.model_dump()
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT id, is_default FROM customer_addresses WHERE id = ? AND customer_id = ?",
+            (address_id, customer_id),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Saved address not found.")
+        make_default = (
+            bool(address["is_default"]) or bool(existing["is_default"])
+        )
+        if make_default:
+            connection.execute(
+                "UPDATE customer_addresses SET is_default = ? WHERE customer_id = ?",
+                (False, customer_id),
+            )
+        connection.execute(
+            """
+            UPDATE customer_addresses
+            SET label = ?, recipient_name = ?, phone = ?,
+                address_line1 = ?, address_line2 = ?, landmark = ?,
+                city = ?, state = ?, postal_code = ?, country = ?, is_default = ?
+            WHERE id = ? AND customer_id = ?
+            """,
+            (
+                address["label"], address["recipient_name"], address["phone"],
+                address["address_line1"], address["address_line2"],
+                address["landmark"], address["city"], address["state"],
+                address["postal_code"], address["country"],
+                make_default, address_id, customer_id,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT
+                id AS address_id, label, recipient_name, phone,
+                address_line1, address_line2, landmark, city, state,
+                postal_code, country, is_default, created_at
+            FROM customer_addresses
+            WHERE id = ? AND customer_id = ?
+            """,
+            (address_id, customer_id),
+        ).fetchone()
+    return dict(row)
+
+
+@app.delete("/customers/addresses/{address_id}")
+def delete_customer_address(
+    address_id: int,
+    current_customer: dict = Depends(get_current_customer),
+):
+    """Delete an address and promote the newest remaining address if needed."""
+
+    customer_id = current_customer["customer_id"]
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT is_default FROM customer_addresses WHERE id = ? AND customer_id = ?",
+            (address_id, customer_id),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Saved address not found.")
+        was_default = bool(existing["is_default"])
+        connection.execute(
+            "DELETE FROM customer_addresses WHERE id = ? AND customer_id = ?",
+            (address_id, customer_id),
+        )
+        if was_default:
+            replacement = connection.execute(
+                """
+                SELECT id FROM customer_addresses
+                WHERE customer_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (customer_id,),
+            ).fetchone()
+            if replacement is not None:
+                connection.execute(
+                    "UPDATE customer_addresses SET is_default = ? WHERE id = ?",
+                    (True, replacement["id"]),
+                )
+    return {"status": "deleted", "address_id": address_id}
 
 @app.post(
     "/customers/session/restore",
