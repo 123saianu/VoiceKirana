@@ -732,8 +732,8 @@ st.subheader("🛒 Grocery order")
 with st.container(border=True):
     st.markdown("### Browse grocery products")
     st.caption(
-        "Compare products from all customer-visible shops, or browse "
-        "one shop at a time. Checkout always belongs to one selected shop."
+        "Search products across all customer-visible shops, or open "
+        "a shop catalogue when you want to browse its products."
     )
 
     try:
@@ -777,6 +777,23 @@ with st.container(border=True):
 
     st.caption(f"Current checkout shop: {selected_shop_name}")
 
+    # Keep catalogue expansion scoped to the currently selected shop.
+    previous_shop_id = st.session_state.get(
+        "_catalogue_previous_shop_id"
+    )
+
+    if previous_shop_id != shop_id:
+        st.session_state["global_catalogue_selected_shop_expanded"] = False
+        st.session_state["single_shop_catalogue_expanded"] = False
+        st.session_state["_catalogue_previous_shop_id"] = shop_id
+
+    st.session_state.setdefault(
+        "global_catalogue_selected_shop_expanded", False
+    )
+    st.session_state.setdefault(
+        "single_shop_catalogue_expanded", False
+    )
+
     browse_mode = st.radio(
         "Browse catalogue",
         options=["All shops", "By shop"],
@@ -787,7 +804,36 @@ with st.container(border=True):
     st.divider()
 
     if browse_mode == "All shops":
-        st.markdown("#### Products across all shops")
+        st.markdown("#### Search products across shops")
+
+        search_col, browse_col = st.columns([3, 2])
+
+        with search_col:
+            search_term = st.text_input(
+                "Search products",
+                placeholder="e.g. rice, milk, sunflower oil",
+                key="global_catalogue_search",
+            ).strip().casefold()
+
+        with browse_col:
+            st.write("")
+            expanded = st.session_state[
+                "global_catalogue_selected_shop_expanded"
+            ]
+            button_label = (
+                "Close selected shop catalogue"
+                if expanded
+                else "Show all available products in this shop"
+            )
+
+            if st.button(
+                button_label,
+                key="toggle_global_shop_catalogue",
+                use_container_width=True,
+            ):
+                st.session_state[
+                    "global_catalogue_selected_shop_expanded"
+                ] = not expanded
 
         try:
             global_catalogue = fetch_public_global_catalogue(
@@ -804,198 +850,282 @@ with st.container(border=True):
         visible_shop_count = global_catalogue["shop_count"]
 
         st.caption(
-            f"{len(global_products)} product group(s) across "
-            f"{visible_shop_count} customer-visible shop(s)."
+            f"{visible_shop_count} customer-visible shop(s) | "
+            f"{len(global_products)} product group(s)"
         )
 
-        search_term = st.text_input(
-            "Search products across shops",
-            placeholder="e.g. rice, milk, sunflower oil",
-            key="global_catalogue_search",
-        ).strip().casefold()
+        # Show matching products only after the customer searches.
+        if search_term:
+            filtered_products = []
 
-        filtered_products = []
+            for product in global_products:
+                searchable_text = " ".join(
+                    str(value)
+                    for value in (
+                        product.get("name"),
+                        product.get("normalized_name"),
+                        product.get("brand"),
+                        product.get("variant"),
+                        product.get("base_unit"),
+                    )
+                    if value
+                ).casefold()
 
-        for product in global_products:
-            searchable_text = " ".join(
-                str(value)
-                for value in (
-                    product.get("name"),
-                    product.get("normalized_name"),
-                    product.get("brand"),
-                    product.get("variant"),
-                    product.get("base_unit"),
-                )
-                if value
-            ).casefold()
+                if search_term in searchable_text:
+                    filtered_products.append(product)
 
-            if not search_term or search_term in searchable_text:
-                filtered_products.append(product)
+            st.markdown("**Search results**")
 
-        if not filtered_products:
-            if global_products:
-                st.info(
-                    "No products match that search. Try another product name."
-                )
-            else:
-                st.info(
-                    "No products have been listed by customer-visible "
-                    "shops yet."
-                )
-
-        else:
-            rupee = chr(0x20B9)
+            if not filtered_products:
+                st.info("No matching products found. Try another search.")
 
             for product_index, product in enumerate(filtered_products):
-                with st.container(border=True):
+                details = [
+                    str(value).strip()
+                    for value in (
+                        product.get("brand"),
+                        product.get("variant"),
+                    )
+                    if value and str(value).strip()
+                ]
+                description = " | ".join(details)
+                unit = product.get("base_unit", "")
+                offers = product.get("offers", [])
+
+                available_offers = [
+                    offer for offer in offers
+                    if offer.get("is_available")
+                ]
+
+                lowest_price = (
+                    min(
+                        float(offer["price_rupees"])
+                        for offer in available_offers
+                    )
+                    if available_offers else None
+                )
+
+                product_col, availability_col = st.columns([3, 2])
+
+                with product_col:
                     st.markdown(
                         f"**{product.get('name', 'Product')}**"
                     )
+                    st.caption(
+                        f"{description + ' | ' if description else ''}"
+                        f"{unit}"
+                    )
+
+                with availability_col:
+                    if lowest_price is not None:
+                        st.write(
+                            f"From ₹{lowest_price:,.2f} / {unit}"
+                        )
+                        st.caption(
+                            f"{len(available_offers)} available "
+                            f"shop offer(s)"
+                        )
+                    else:
+                        st.warning("Currently unavailable")
+
+                if offers:
+                    with st.expander(
+                        f"Compare {len(offers)} shop offer(s)",
+                        expanded=False,
+                    ):
+                        for offer_index, offer in enumerate(offers):
+                            offer_shop_id = int(offer["shop_id"])
+                            offer_shop_name = str(offer["shop_name"])
+
+                            shop_col, price_col, status_col, choose_col = (
+                                st.columns([3, 2, 2, 2])
+                            )
+
+                            with shop_col:
+                                st.write(offer_shop_name)
+
+                            with price_col:
+                                st.write(
+                                    f"₹{float(offer['price_rupees']):,.2f}"
+                                    f" / {unit}"
+                                )
+
+                            with status_col:
+                                if offer.get("is_available"):
+                                    st.success("Available")
+                                else:
+                                    st.warning("Unavailable")
+
+                            with choose_col:
+                                already_selected = offer_shop_id == shop_id
+                                st.button(
+                                    "Selected" if already_selected else "Choose",
+                                    key=(
+                                        f"search_offer_choose_"
+                                        f"{product_index}_{offer_index}_"
+                                        f"{offer_shop_id}"
+                                    ),
+                                    disabled=already_selected,
+                                    on_click=select_catalogue_offer_shop,
+                                    args=(
+                                        offer_shop_id,
+                                        offer_shop_name,
+                                    ),
+                                    use_container_width=True,
+                                )
+
+                st.divider()
+
+        else:
+            st.info(
+                "Search for a product to compare prices and availability "
+                "across shops. Use the button above to browse every "
+                "available product in your selected shop."
+            )
+
+        # Optional compact list of all available products in selected shop.
+        if st.session_state[
+            "global_catalogue_selected_shop_expanded"
+        ]:
+            st.markdown(
+                f"#### Available products at {selected_shop_name}"
+            )
+
+            selected_shop_products = []
+
+            for product in global_products:
+                matching_offers = [
+                    offer
+                    for offer in product.get("offers", [])
+                    if (
+                        int(offer["shop_id"]) == shop_id
+                        and offer.get("is_available")
+                    )
+                ]
+
+                for offer in matching_offers:
+                    selected_shop_products.append((product, offer))
+
+            if not selected_shop_products:
+                st.info(
+                    "This shop has no currently available products."
+                )
+            else:
+                st.caption(
+                    f"{len(selected_shop_products)} available product(s)"
+                )
+
+                for product, offer in selected_shop_products:
+                    product_col, price_col, status_col = st.columns([4, 2, 2])
 
                     details = [
-                        product.get("brand"),
-                        product.get("variant"),
-                    ]
-                    details = [
                         str(value).strip()
-                        for value in details
+                        for value in (
+                            product.get("brand"),
+                            product.get("variant"),
+                        )
                         if value and str(value).strip()
                     ]
 
-                    description = (
-                        " | ".join(details)
-                        if details
-                        else "Standard product"
-                    )
-                    unit = product.get("base_unit", "")
-
-                    st.caption(
-                        f"{description} | Unit: {unit} | "
-                        f"{product.get('offer_count', 0)} shop offer(s)"
-                    )
-
-                    offers = product.get("offers", [])
-
-                    if not isinstance(offers, list) or not offers:
-                        st.caption("No shop offers are currently listed.")
-
-                    for offer in offers:
-                        shop_column, price_column, stock_column, action_column = (
-                            st.columns([3, 2, 2, 2])
+                    with product_col:
+                        st.write(f"**{product.get('name', 'Product')}**")
+                        st.caption(
+                            f"{' | '.join(details) + ' | ' if details else ''}"
+                            f"{product.get('base_unit', '')}"
                         )
 
-                        offer_shop_id = int(offer["shop_id"])
-                        offer_shop_name = str(offer["shop_name"])
+                    with price_col:
+                        st.write(
+                            f"₹{float(offer['price_rupees']):,.2f}"
+                            f" / {product.get('base_unit', '')}"
+                        )
 
-                        with shop_column:
-                            st.write(offer_shop_name)
+                    with status_col:
+                        st.success("Available")
 
-                        with price_column:
-                            st.write(
-                                f"{rupee}{float(offer['price_rupees']):,.2f}"
-                                f" / {unit}"
-                            )
-
-                        with stock_column:
-                            if offer.get("is_available"):
-                                st.success("Available")
-                            else:
-                                st.warning("Unavailable")
-
-                        with action_column:
-                            st.button(
-                                "Choose",
-                                key=(
-                                    f"global_catalogue_choose_"
-                                    f"{product_index}_{offer_shop_id}"
-                                ),
-                                help=(
-                                    "Use this shop for checkout. "
-                                    "This does not place an order."
-                                ),
-                                on_click=select_catalogue_offer_shop,
-                                args=(
-                                    offer_shop_id,
-                                    offer_shop_name,
-                                ),
-                                use_container_width=True,
-                            )
-
-        st.caption(
-            "Each price and availability status belongs to its individual "
-            "shop. Choosing an offer changes the checkout shop; products "
-            "from different shops are not combined into one order."
-        )
+                    st.divider()
 
     else:
         st.markdown("#### Browse this shop's catalogue")
 
-        try:
-            catalogue_items = fetch_public_shop_catalogue(
-                backend_url,
-                shop_id,
-            )
-        except (requests.RequestException, ValueError) as exc:
-            st.error(
-                "Could not load this shop's catalogue. "
-                f"Details: {exc}"
-            )
-            st.stop()
+        expanded = st.session_state[
+            "single_shop_catalogue_expanded"
+        ]
+        button_label = (
+            "Close shop catalogue"
+            if expanded
+            else "Show all products"
+        )
 
-        if not catalogue_items:
-            st.info(
-                "This shop has not listed any products yet."
-            )
+        if st.button(
+            button_label,
+            key="toggle_single_shop_catalogue",
+            use_container_width=False,
+        ):
+            st.session_state[
+                "single_shop_catalogue_expanded"
+            ] = not expanded
 
-        else:
-            rupee = chr(0x20B9)
+        if st.session_state["single_shop_catalogue_expanded"]:
+            try:
+                catalogue_items = fetch_public_shop_catalogue(
+                    backend_url,
+                    shop_id,
+                )
+            except (requests.RequestException, ValueError) as exc:
+                st.error(
+                    "Could not load this shop's catalogue. "
+                    f"Details: {exc}"
+                )
+                st.stop()
 
-            for row_start in range(0, len(catalogue_items), 3):
-                product_columns = st.columns(3)
+            if not catalogue_items:
+                st.info("This shop has not listed any products yet.")
+            else:
+                st.caption(
+                    f"{len(catalogue_items)} product(s) listed by "
+                    f"{selected_shop_name}"
+                )
 
-                for column, product in zip(
-                    product_columns,
-                    catalogue_items[row_start:row_start + 3],
-                ):
-                    with column:
-                        with st.container(border=True):
-                            st.markdown(
-                                f"**{product.get('name', 'Product')}**"
+                for product in catalogue_items:
+                    product_col, price_col, status_col = st.columns([4, 2, 2])
+
+                    details = [
+                        str(value).strip()
+                        for value in (
+                            product.get("brand"),
+                            product.get("variant"),
+                        )
+                        if value and str(value).strip()
+                    ]
+
+                    with product_col:
+                        st.write(f"**{product.get('name', 'Product')}**")
+                        st.caption(
+                            f"{' | '.join(details) + ' | ' if details else ''}"
+                            f"{product.get('base_unit', '')}"
+                        )
+
+                    with price_col:
+                        price = product.get("price_rupees")
+                        if price is not None:
+                            st.write(
+                                f"₹{float(price):,.2f} / "
+                                f"{product.get('base_unit', '')}"
                             )
 
-                            product_details = [
-                                product.get("brand"),
-                                product.get("variant"),
-                            ]
-                            product_details = [
-                                str(value).strip()
-                                for value in product_details
-                                if value and str(value).strip()
-                            ]
+                    with status_col:
+                        if product.get("is_available"):
+                            st.success("Available")
+                        else:
+                            st.warning("Unavailable")
 
-                            if product_details:
-                                st.caption(" | ".join(product_details))
-                            else:
-                                st.caption("Standard grocery product")
-
-                            price = product.get("price_rupees")
-                            unit = product.get("base_unit", "")
-
-                            if price is not None:
-                                st.markdown(
-                                    f"**{rupee}{float(price):,.2f} / {unit}**"
-                                )
-
-                            if product.get("is_available"):
-                                st.success("Available")
-                            else:
-                                st.warning("Currently unavailable")
+                    st.divider()
 
             st.caption(
-                "Prices and availability are specific to the selected shop. "
+                "Prices and availability are specific to this shop. "
                 "Exact stock quantities are not publicly displayed."
             )
-
 
 language = st.selectbox(
     "Request language",
