@@ -36,6 +36,9 @@ from backend.models.auth import (
 from backend.models.customer import (
     CustomerRegisterRequest,
     CustomerProfileResponse,
+    CustomerLoginRequest,
+    CustomerRememberRequest,
+    CustomerLoginResponse,
 )
 from backend.models.catalogue import (
     ShopProductCreate,
@@ -64,6 +67,11 @@ from backend.services.razorpay_service import (
     get_razorpay_public_key_id,
 )
 from backend.services.inventory_service import find_inventory
+from backend.services.customer_session_service import (
+    create_customer_remember_session,
+    rotate_customer_remember_session,
+    revoke_customer_remember_session,
+)
 
 
 load_dotenv()
@@ -1986,8 +1994,12 @@ def register_customer(payload: CustomerRegisterRequest):
     }
 
 
-@app.post("/customers/login", response_model=AccessTokenResponse)
-def customer_login(payload: LoginRequest):
+@app.post(
+    "/customers/login",
+    response_model=CustomerLoginResponse,
+    response_model_exclude_none=True,
+)
+def customer_login(payload: CustomerLoginRequest):
     """Authenticate a customer and issue a customer-specific JWT."""
 
     with get_connection() as connection:
@@ -2034,11 +2046,25 @@ def customer_login(payload: LoginRequest):
         principal_type="customer",
     )
 
-    return {
+    response = {
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "customer": {
+            "customer_id": customer["id"],
+            "full_name": customer["full_name"],
+            "email": customer["email"],
+        },
     }
+
+    if payload.remember_me:
+        remember_session = create_customer_remember_session(
+            customer["id"]
+        )
+        response["remember_token"] = remember_session["remember_token"]
+        response["remember_expires_in"] = remember_session["expires_in"]
+
+    return response
 
 
 @app.get(
@@ -2051,6 +2077,54 @@ def get_customer_profile(
     """Return the authenticated customer's profile."""
 
     return current_customer
+
+@app.post(
+    "/customers/session/restore",
+    response_model=CustomerLoginResponse,
+)
+def restore_customer_session(payload: CustomerRememberRequest):
+    """Rotate a persistent remember-me token and issue a fresh access token."""
+
+    session = rotate_customer_remember_session(
+        payload.remember_token
+    )
+
+    if session is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Remember-me session is invalid or expired. Please sign in again.",
+        )
+
+    access_token = create_access_token(
+        session["customer_id"],
+        principal_type="customer",
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "remember_token": session["remember_token"],
+        "remember_expires_in": session["expires_in"],
+        "customer": {
+            "customer_id": session["customer_id"],
+            "full_name": session["full_name"],
+            "email": session["email"],
+        },
+    }
+
+
+@app.post("/customers/session/logout")
+def logout_customer_session(payload: CustomerRememberRequest):
+    """Revoke one persistent customer session."""
+
+    revoke_customer_remember_session(
+        payload.remember_token
+    )
+
+    # Return the same response whether or not the token existed.
+    return {"status": "logged_out"}
+
 
 @app.post("/customers/orders/confirm", status_code=status.HTTP_201_CREATED)
 def confirm_customer_order(

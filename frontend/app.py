@@ -4,10 +4,13 @@ import sys
 import tempfile
 from pathlib import Path
 import uuid
+from datetime import datetime, timedelta, timezone
+import time
 from urllib.parse import quote
 
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 from dotenv import load_dotenv
 
 # VOICEKIRANA_PROJECT_ROOT_BOOTSTRAP
@@ -44,19 +47,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root {
-        --vk-green: #166534;
-        --vk-dark-green: #14532D;
-        --vk-soft-green: #F3F7EF;
-        --vk-page: #F7F9F5;
-        --vk-text: #17251D;
-        --vk-muted: #68766C;
-        --vk-border: #E4EAE2;
-    }
-
-    .stApp {
-        background: var(--vk-page);
-    }
+    /* VoiceKirana layout styling.
+       Colors are controlled by .streamlit/config.toml. */
 
     .block-container {
         max-width: 1180px;
@@ -65,14 +57,7 @@ st.markdown(
     }
 
     h1, h2, h3, h4 {
-        color: var(--vk-dark-green);
         letter-spacing: -0.035em;
-    }
-
-    .stApp p,
-    .stApp label,
-    .stApp [data-testid="stCaptionContainer"] {
-        color: var(--vk-text);
     }
 
     .stButton > button {
@@ -80,29 +65,6 @@ st.markdown(
         border-radius: 11px;
         font-weight: 650;
         transition: all 0.18s ease;
-        border: 1px solid var(--vk-border);
-    }
-
-    .stButton > button[kind="primary"] {
-        background: var(--vk-green);
-        border-color: var(--vk-green);
-        color: #FFFFFF !important;
-    }
-
-    .stButton > button[kind="primary"]:hover {
-        background: var(--vk-dark-green);
-        border-color: var(--vk-dark-green);
-        color: #FFFFFF !important;
-    }
-
-    .stButton > button:not([kind="primary"]) {
-        background: #FFFFFF;
-        color: var(--vk-dark-green) !important;
-    }
-
-    .stButton > button:not([kind="primary"]):hover {
-        border-color: var(--vk-green);
-        color: var(--vk-green) !important;
     }
 
     .stTextInput input,
@@ -110,7 +72,6 @@ st.markdown(
     .stNumberInput input,
     .stSelectbox div[data-baseweb="select"] {
         border-radius: 10px;
-        background: #FFFFFF;
     }
 
     div[data-testid="stAlert"] {
@@ -119,21 +80,20 @@ st.markdown(
 
     details[data-testid="stExpander"] {
         border-radius: 12px;
-        border: 1px solid var(--vk-border);
-        background: #FFFFFF;
     }
 
     .vk-hero {
-        background: linear-gradient(125deg, #FFFFFF 0%, #F0F7ED 100%);
-        border: 1px solid var(--vk-border);
         border-radius: 22px;
         padding: 30px 34px;
         margin: 0 0 24px 0;
-        box-shadow: 0 8px 28px rgba(20, 83, 45, 0.055);
+    }
+
+    .vk-hero,
+    .vk-hero * {
+        color: inherit;
     }
 
     .vk-brand {
-        color: var(--vk-green);
         font-size: 0.82rem;
         font-weight: 800;
         letter-spacing: 0.13em;
@@ -142,7 +102,6 @@ st.markdown(
     }
 
     .vk-hero h1 {
-        color: var(--vk-dark-green);
         font-size: clamp(2rem, 4vw, 3.1rem);
         line-height: 1.12;
         font-weight: 800;
@@ -150,7 +109,6 @@ st.markdown(
     }
 
     .vk-hero p {
-        color: var(--vk-muted);
         font-size: 1.04rem;
         line-height: 1.65;
         max-width: 720px;
@@ -161,30 +119,30 @@ st.markdown(
         display: inline-block;
         margin-top: 18px;
         padding: 7px 12px;
+        border: 1px solid currentColor;
         border-radius: 999px;
-        background: #E4F1E2;
-        color: var(--vk-dark-green);
         font-size: 0.82rem;
         font-weight: 650;
     }
 
     .vk-section-intro {
-        background: #FFFFFF;
-        border: 1px solid var(--vk-border);
         border-radius: 16px;
         padding: 18px 20px;
         margin: 8px 0 14px 0;
     }
 
+    .vk-section-intro,
+    .vk-section-intro * {
+        color: inherit;
+    }
+
     .vk-section-intro h3 {
         margin: 0 0 5px 0;
-        color: var(--vk-dark-green);
         font-size: 1.2rem;
     }
 
     .vk-section-intro p {
         margin: 0;
-        color: var(--vk-muted);
         font-size: 0.93rem;
     }
 
@@ -235,6 +193,338 @@ backend_url = os.getenv(
 ).rstrip("/")
 
 api_token = os.getenv("VOICEKIRANA_API_TOKEN")
+
+
+# VOICEKIRANA_OPENING_AUTH_GATE
+# ---------------------------------------------------------
+# Customer sign-in is required before the main application.
+# Remember-me uses an opaque, rotating browser cookie.
+# ---------------------------------------------------------
+
+REMEMBER_COOKIE_NAME = "vk_customer_remember"
+REMEMBER_SESSION_SECONDS = 30 * 24 * 60 * 60
+
+COOKIE_SECURE = os.getenv(
+    "VOICEKIRANA_COOKIE_SECURE", "false"
+).strip().casefold() in {"1", "true", "yes", "on"}
+
+for _key, _default in (
+    ("customer_access_token", None),
+    ("customer_access_expires_at", 0),
+    ("customer_remember_token", None),
+    ("customer_profile", None),
+    ("customer_restore_attempted", False),
+    ("order_history_result", None),
+    ("order_lookup_result", None),
+    ("order_lookup_customer_id", None),
+):
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
+
+
+def _customer_error_detail(response, fallback):
+    try:
+        detail = response.json().get("detail", fallback)
+    except ValueError:
+        return fallback
+
+    if isinstance(detail, dict):
+        detail = detail.get("message", detail)
+
+    return str(detail)
+
+
+def _clear_customer_session():
+    st.session_state.customer_access_token = None
+    st.session_state.customer_access_expires_at = 0
+    st.session_state.customer_remember_token = None
+    st.session_state.customer_profile = None
+    st.session_state.customer_restore_attempted = False
+    st.session_state.order_history_result = None
+    st.session_state.order_lookup_result = None
+    st.session_state.order_lookup_customer_id = None
+    st.session_state.saved_order_result = None
+
+
+def _apply_customer_login(payload, cookie_manager, remember_me):
+    """Store the short-lived access token and optionally persist login."""
+
+    access_token = payload.get("access_token")
+    token_type = str(payload.get("token_type", "bearer")).casefold()
+
+    if not access_token or token_type != "bearer":
+        raise ValueError("The authentication service returned an invalid token.")
+
+    profile = payload.get("customer")
+
+    if not isinstance(profile, dict) or not profile.get("customer_id"):
+        profile_response = requests.get(
+            f"{backend_url}/customers/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+        profile_response.raise_for_status()
+        profile = profile_response.json()
+
+    st.session_state.customer_access_token = access_token
+    st.session_state.customer_access_expires_at = (
+        time.time() + int(payload.get("expires_in", 28800))
+    )
+    st.session_state.customer_profile = profile
+    st.session_state.customer_restore_attempted = False
+    st.session_state.order_history_result = None
+    st.session_state.order_lookup_result = None
+    st.session_state.order_lookup_customer_id = None
+    st.session_state.saved_order_result = None
+
+    remember_token = payload.get("remember_token")
+
+    if remember_me and remember_token:
+        cookie_manager.set(
+            REMEMBER_COOKIE_NAME,
+            remember_token,
+            key="vk_customer_remember_set",
+            path="/",
+            expires_at=(
+                datetime.now(timezone.utc)
+                + timedelta(days=30)
+            ),
+            max_age=REMEMBER_SESSION_SECONDS,
+            secure=COOKIE_SECURE,
+            same_site="lax",
+        )
+        st.session_state.customer_remember_token = remember_token
+    else:
+        st.session_state.customer_remember_token = None
+        try:
+            cookies = cookie_manager.get_all(
+                key="vk_customer_cookie_clear_check"
+            ) or {}
+            if REMEMBER_COOKIE_NAME in cookies:
+                cookie_manager.delete(
+                    REMEMBER_COOKIE_NAME,
+                    key="vk_customer_remember_delete",
+                )
+        except (KeyError, TypeError):
+            pass
+
+
+def _sign_out_customer(cookie_manager, backend_url):
+    """Revoke the persistent session and clear the local customer session."""
+
+    remember_token = st.session_state.get("customer_remember_token")
+
+    try:
+        cookies = cookie_manager.get_all(
+            key="vk_customer_signout_cookie_read"
+        ) or {}
+        remember_token = (
+            remember_token or cookies.get(REMEMBER_COOKIE_NAME)
+        )
+
+        if remember_token:
+            requests.post(
+                f"{backend_url}/customers/session/logout",
+                json={"remember_token": remember_token},
+                timeout=10,
+            )
+
+        if REMEMBER_COOKIE_NAME in cookies:
+            cookie_manager.delete(
+                REMEMBER_COOKIE_NAME,
+                key="vk_customer_signout_cookie_delete",
+            )
+
+    except (requests.RequestException, KeyError, TypeError):
+        # Local logout must still complete if the backend is unreachable.
+        pass
+
+    _clear_customer_session()
+
+
+# Create a browser cookie manager for this Streamlit session.
+cookie_manager = stx.CookieManager(
+    key="voicekirana_customer_cookie_manager"
+)
+
+browser_cookies = cookie_manager.get_all(
+    key="voicekirana_customer_cookie_bootstrap"
+) or {}
+
+browser_remember_token = browser_cookies.get(REMEMBER_COOKIE_NAME)
+
+# Restore from the opaque browser cookie when the access token is absent
+# or close to its 8-hour expiry.
+access_token_expiring = (
+    not st.session_state.customer_access_token
+    or time.time() >= (
+        float(st.session_state.customer_access_expires_at or 0) - 60
+    )
+)
+
+if access_token_expiring:
+    st.session_state.customer_access_token = None
+
+    if (
+        browser_remember_token
+        and not st.session_state.customer_restore_attempted
+    ):
+        st.session_state.customer_restore_attempted = True
+
+        try:
+            with st.spinner("Restoring your VoiceKirana account..."):
+                restore_response = requests.post(
+                    f"{backend_url}/customers/session/restore",
+                    json={
+                        "remember_token": browser_remember_token
+                    },
+                    timeout=15,
+                )
+
+            if restore_response.ok:
+                restored_payload = restore_response.json()
+                _apply_customer_login(
+                    restored_payload,
+                    cookie_manager,
+                    remember_me=True,
+                )
+                st.rerun()
+            else:
+                cookie_manager.delete(
+                    REMEMBER_COOKIE_NAME,
+                    key="vk_customer_expired_cookie_delete",
+                )
+                st.session_state.customer_remember_token = None
+                st.session_state.customer_profile = None
+                st.warning(
+                    "Your saved sign-in has expired. Please sign in again."
+                )
+
+        except requests.RequestException as exc:
+            st.error(
+                f"Could not restore your customer account: {exc}"
+            )
+
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile")
+
+if not customer_token or not customer_profile:
+    st.markdown("## Welcome to VoiceKirana")
+    st.caption(
+        "Sign in or create your customer account to start shopping."
+    )
+
+    with st.container(border=True):
+        auth_mode = st.radio(
+            "Your account",
+            options=("Sign in", "Create account"),
+            horizontal=True,
+            key="opening_customer_auth_mode",
+        )
+
+        with st.form("opening_customer_auth_form"):
+            full_name = ""
+
+            if auth_mode == "Create account":
+                full_name = st.text_input(
+                    "Full name",
+                    max_chars=150,
+                    key="opening_customer_full_name",
+                ).strip()
+
+            email = st.text_input(
+                "Email address",
+                key="opening_customer_email",
+            ).strip()
+
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="opening_customer_password",
+            )
+
+            remember_me = st.checkbox(
+                "Remember me on this device",
+                value=True,
+                key="opening_customer_remember_me",
+            )
+
+            submitted = st.form_submit_button(
+                "Create account" if auth_mode == "Create account" else "Sign in",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submitted:
+            if not email or not password:
+                st.warning("Enter both your email address and password.")
+                st.stop()
+
+            if auth_mode == "Create account" and not full_name:
+                st.warning("Enter your full name.")
+                st.stop()
+
+            if auth_mode == "Create account" and len(password) < 12:
+                st.warning("Your password must contain at least 12 characters.")
+                st.stop()
+
+            try:
+                with st.spinner("Signing in to VoiceKirana..."):
+                    if auth_mode == "Create account":
+                        registration = requests.post(
+                            f"{backend_url}/customers/register",
+                            json={
+                                "full_name": full_name,
+                                "email": email,
+                                "password": password,
+                            },
+                            timeout=15,
+                        )
+
+                        if not registration.ok:
+                            st.error(
+                                "Account creation failed "
+                                f"({registration.status_code}): "
+                                f"{_customer_error_detail(registration, 'Could not create your account.')}"
+                            )
+                            st.stop()
+
+                    login_response = requests.post(
+                        f"{backend_url}/customers/login",
+                        json={
+                            "email": email,
+                            "password": password,
+                            "remember_me": remember_me,
+                        },
+                        timeout=15,
+                    )
+
+                if not login_response.ok:
+                    st.error(
+                        f"Sign-in failed ({login_response.status_code}): "
+                        f"{_customer_error_detail(login_response, 'Check your email and password.')}"
+                    )
+                else:
+                    login_payload = login_response.json()
+                    _apply_customer_login(
+                        login_payload,
+                        cookie_manager,
+                        remember_me=remember_me,
+                    )
+                    st.success("Welcome to VoiceKirana!")
+                    st.rerun()
+
+            except requests.RequestException as exc:
+                st.error(f"Could not connect to the account service: {exc}")
+            except (ValueError, TypeError) as exc:
+                st.error(f"Could not complete sign-in: {exc}")
+
+    st.stop()
+
+# ---------------------------------------------------------
+# Authenticated customer — main application is now unlocked
+# ---------------------------------------------------------
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_active_shops(api_base_url):
@@ -337,6 +627,45 @@ if "saved_order_result" not in st.session_state:
     st.session_state.saved_order_result = None
 
 
+def _invalidate_cart_previews():
+    """Invalidate previews and comparisons whenever cart contents change."""
+    for key in (
+        "pending_order_payload",
+        "pending_shop_id",
+        "pending_idempotency_key",
+        "saved_order_result",
+        "cart_result",
+        "shop_comparison_results",
+        "shop_comparison_payload_signature",
+    ):
+        if key in st.session_state:
+            st.session_state[key] = None
+
+
+def _active_cart_item_count():
+    """Count populated cart rows, excluding empty placeholders."""
+    count = 0
+
+    for item_id in st.session_state.get("cart_item_ids", []):
+        name = str(
+            st.session_state.get(f"cart_{item_id}_name", "")
+        ).strip()
+
+        try:
+            quantity = float(
+                st.session_state.get(
+                    f"cart_{item_id}_quantity", 0
+                ) or 0
+            )
+        except (TypeError, ValueError):
+            quantity = 0
+
+        if name and quantity > 0:
+            count += 1
+
+    return count
+
+
 def add_cart_item():
     """Add a new, empty product row."""
     new_id = st.session_state.next_cart_item_id
@@ -345,8 +674,8 @@ def add_cart_item():
 
 
 def remove_cart_item(item_id):
-    """Remove a product row and its widget values."""
-    if len(st.session_state.cart_item_ids) <= 1:
+    """Remove a cart row, including when it is the last remaining row."""
+    if item_id not in st.session_state.cart_item_ids:
         return
 
     st.session_state.cart_item_ids.remove(item_id)
@@ -361,10 +690,369 @@ def remove_cart_item(item_id):
         "needs_clarification",
         "clarification_reason",
         "clarification_resolved",
+        "catalogue_offer_key",
     ):
         key = f"cart_{item_id}_{field}"
         if key in st.session_state:
             del st.session_state[key]
+
+    _invalidate_cart_previews()
+
+
+def _catalogue_offer_key(shop_id, product_id):
+    return f"{int(shop_id)}:{int(product_id)}"
+
+
+def _find_catalogue_cart_item(
+    shop_id,
+    product_id,
+    name,
+    normalized_name,
+    unit,
+    brand=None,
+    variant=None,
+):
+    """Find an existing catalogue row or matching manually entered row."""
+
+    offer_key = _catalogue_offer_key(shop_id, product_id)
+
+    # Exact shop/product match first.
+    for item_id in st.session_state.cart_item_ids:
+        if (
+            st.session_state.get(
+                f"cart_{item_id}_catalogue_offer_key"
+            ) == offer_key
+        ):
+            return item_id
+
+    # Reuse a manual cart row with the same product identity.
+    target_identity = (
+        (normalized_name or name).strip().casefold(),
+        (unit or "").strip().casefold(),
+        (brand or "").strip().casefold(),
+        (variant or "").strip().casefold(),
+    )
+
+    for item_id in st.session_state.cart_item_ids:
+        existing_offer_key = st.session_state.get(
+            f"cart_{item_id}_catalogue_offer_key"
+        )
+
+        if existing_offer_key and existing_offer_key != offer_key:
+            continue
+
+        existing_name = str(
+            st.session_state.get(f"cart_{item_id}_name", "")
+        ).strip()
+
+        existing_normalized = str(
+            st.session_state.get(
+                f"cart_{item_id}_normalized", ""
+            )
+        ).strip()
+
+        existing_unit = str(
+            st.session_state.get(f"cart_{item_id}_unit", "")
+        ).strip()
+
+        existing_brand = str(
+            st.session_state.get(f"cart_{item_id}_brand", "")
+        ).strip()
+
+        existing_variant = str(
+            st.session_state.get(f"cart_{item_id}_variant", "")
+        ).strip()
+
+        try:
+            existing_quantity = float(
+                st.session_state.get(
+                    f"cart_{item_id}_quantity", 0
+                ) or 0
+            )
+        except (TypeError, ValueError):
+            existing_quantity = 0
+
+        if not existing_name or existing_quantity <= 0:
+            continue
+
+        existing_identity = (
+            (existing_normalized or existing_name).casefold(),
+            existing_unit.casefold(),
+            existing_brand.casefold(),
+            existing_variant.casefold(),
+        )
+
+        if existing_identity == target_identity:
+            st.session_state[
+                f"cart_{item_id}_catalogue_offer_key"
+            ] = offer_key
+            return item_id
+
+    return None
+
+
+def add_catalogue_product_to_cart(
+    shop_id,
+    shop_name,
+    product_id,
+    name,
+    normalized_name,
+    unit,
+    brand=None,
+    variant=None,
+):
+    """Add one base unit or increment the existing catalogue cart row."""
+
+    selected_shop = st.session_state.get("customer_shop_selector")
+
+    if selected_shop and int(selected_shop[0]) != int(shop_id):
+        st.session_state["catalogue_cart_notice"] = (
+            "Choose the checkout shop before adding products from it."
+        )
+        return
+
+    st.session_state["customer_shop_selector"] = (
+        int(shop_id),
+        str(shop_name),
+    )
+
+    item_id = _find_catalogue_cart_item(
+        shop_id,
+        product_id,
+        name,
+        normalized_name,
+        unit,
+        brand,
+        variant,
+    )
+
+    if item_id is not None:
+        quantity_key = f"cart_{item_id}_quantity"
+        current_quantity = float(
+            st.session_state.get(quantity_key, 0) or 0
+        )
+        new_quantity = current_quantity + 1.0
+        st.session_state[quantity_key] = new_quantity
+
+    else:
+        # Reuse a completely empty row, if one exists.
+        item_id = None
+
+        for candidate_id in st.session_state.cart_item_ids:
+            fields = (
+                "name",
+                "normalized",
+                "unit",
+                "brand",
+                "variant",
+            )
+            row_values = [
+                str(
+                    st.session_state.get(
+                        f"cart_{candidate_id}_{field}", ""
+                    )
+                ).strip()
+                for field in fields
+            ]
+
+            try:
+                quantity = float(
+                    st.session_state.get(
+                        f"cart_{candidate_id}_quantity", 0
+                    ) or 0
+                )
+            except (TypeError, ValueError):
+                quantity = 0
+
+            if not any(row_values) and quantity == 0:
+                item_id = candidate_id
+                break
+
+        if item_id is None:
+            add_cart_item()
+            item_id = st.session_state.cart_item_ids[-1]
+
+        st.session_state[f"cart_{item_id}_name"] = name
+        st.session_state[f"cart_{item_id}_normalized"] = (
+            normalized_name or name.casefold()
+        )
+        st.session_state[f"cart_{item_id}_quantity"] = 1.0
+        st.session_state[f"cart_{item_id}_unit"] = unit
+        st.session_state[f"cart_{item_id}_brand"] = brand or ""
+        st.session_state[f"cart_{item_id}_variant"] = variant or ""
+        st.session_state[
+            f"cart_{item_id}_needs_clarification"
+        ] = False
+        st.session_state[
+            f"cart_{item_id}_clarification_reason"
+        ] = ""
+        st.session_state[
+            f"cart_{item_id}_clarification_resolved"
+        ] = False
+        st.session_state[
+            f"cart_{item_id}_catalogue_offer_key"
+        ] = _catalogue_offer_key(shop_id, product_id)
+
+        new_quantity = 1.0
+
+    _invalidate_cart_previews()
+
+    st.session_state["catalogue_cart_notice"] = (
+        f"{name}: {new_quantity:g} {unit} in your cart."
+    )
+
+
+def remove_catalogue_product_from_cart(shop_id, product_id):
+    """Decrease one base unit; remove the row when it reaches zero."""
+
+    offer_key = _catalogue_offer_key(shop_id, product_id)
+
+    for item_id in list(st.session_state.cart_item_ids):
+        if (
+            st.session_state.get(
+                f"cart_{item_id}_catalogue_offer_key"
+            ) != offer_key
+        ):
+            continue
+
+        quantity_key = f"cart_{item_id}_quantity"
+        quantity = float(
+            st.session_state.get(quantity_key, 0) or 0
+        )
+
+        if quantity <= 1:
+            remove_cart_item(item_id)
+            st.session_state["catalogue_cart_notice"] = (
+                "Product removed from your cart."
+            )
+        else:
+            new_quantity = quantity - 1.0
+            st.session_state[quantity_key] = new_quantity
+            _invalidate_cart_previews()
+            st.session_state["catalogue_cart_notice"] = (
+                f"Cart quantity updated to {new_quantity:g}."
+            )
+
+        return
+
+
+def get_catalogue_product_quantity(shop_id, product):
+    """Return the quantity currently selected for this shop's product."""
+
+    product_id = product.get("product_id")
+    if product_id is None:
+        return 0.0
+
+    item_id = _find_catalogue_cart_item(
+        shop_id=shop_id,
+        product_id=product_id,
+        name=product.get("name", ""),
+        normalized_name=product.get("normalized_name"),
+        unit=product.get("base_unit", ""),
+        brand=product.get("brand"),
+        variant=product.get("variant"),
+    )
+
+    if item_id is None:
+        return 0.0
+
+    return float(
+        st.session_state.get(
+            f"cart_{item_id}_quantity", 0
+        ) or 0
+    )
+
+
+def render_catalogue_quantity_control(
+    shop_id,
+    shop_name,
+    product,
+    key_prefix,
+):
+    """Render Add or the minus / quantity / plus control for one offer."""
+
+    if not product.get("is_available"):
+        st.caption("Not available")
+        return
+
+    product_id = product.get("product_id")
+    if product_id is None:
+        st.caption("Unavailable")
+        return
+
+    selected_shop = st.session_state.get("customer_shop_selector")
+    selected_shop_id = (
+        int(selected_shop[0]) if selected_shop else None
+    )
+
+    if selected_shop_id != int(shop_id):
+        st.button(
+            "Choose shop",
+            key=f"{key_prefix}_choose_shop",
+            disabled=_active_cart_item_count() > 0,
+            help=(
+                "Choose this shop before adding its products. "
+                "Empty your cart first to switch shops."
+            ),
+            on_click=select_catalogue_offer_shop,
+            args=(int(shop_id), str(shop_name)),
+            use_container_width=True,
+        )
+        return
+
+    quantity = get_catalogue_product_quantity(shop_id, product)
+
+    callback_args = (
+        int(shop_id),
+        str(shop_name),
+        int(product_id),
+        str(product.get("name", "")),
+        str(
+            product.get("normalized_name")
+            or product.get("name", "")
+        ),
+        str(product.get("base_unit", "")),
+        product.get("brand"),
+        product.get("variant"),
+    )
+
+    if quantity <= 0:
+        st.button(
+            "Add +",
+            key=f"{key_prefix}_add",
+            type="primary",
+            on_click=add_catalogue_product_to_cart,
+            args=callback_args,
+            use_container_width=True,
+        )
+        return
+
+    minus_col, quantity_col, plus_col = st.columns([1, 1, 1])
+
+    with minus_col:
+        st.button(
+            "−",
+            key=f"{key_prefix}_minus",
+            on_click=remove_catalogue_product_from_cart,
+            args=(int(shop_id), int(product_id)),
+            use_container_width=True,
+        )
+
+    with quantity_col:
+        st.markdown(
+            f"<div style='text-align:center; padding-top:0.35rem; "
+            f"font-weight:700'>{quantity:g}</div>",
+            unsafe_allow_html=True,
+        )
+
+    with plus_col:
+        st.button(
+            "＋",
+            key=f"{key_prefix}_plus",
+            on_click=add_catalogue_product_to_cart,
+            args=callback_args,
+            use_container_width=True,
+        )
 
 
 # VOICEKIRANA_MULTILINGUAL_MICROPHONE
@@ -418,7 +1106,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-voice_audio = st.experimental_audio_input(
+voice_audio = st.audio_input(
     "Record your grocery request",
     key=f"voice_input_{st.session_state.voice_widget_version}",
 )
@@ -765,17 +1453,29 @@ with st.container(border=True):
         )
         st.stop()
 
+    cart_has_active_items = _active_cart_item_count() > 0
+
     selected_shop = st.selectbox(
         "Shop for checkout",
         options=shop_options,
         format_func=lambda option: option[1],
         key="customer_shop_selector",
+        disabled=cart_has_active_items,
     )
+
+    if cart_has_active_items:
+        st.caption(
+            "Remove all cart items before changing the checkout shop."
+        )
 
     shop_id = int(selected_shop[0])
     selected_shop_name = selected_shop[1]
 
     st.caption(f"Current checkout shop: {selected_shop_name}")
+
+    cart_notice = st.session_state.pop("catalogue_cart_notice", None)
+    if cart_notice:
+        st.success(cart_notice)
 
     # Keep catalogue expansion scoped to the currently selected shop.
     previous_shop_id = st.session_state.get(
@@ -957,21 +1657,20 @@ with st.container(border=True):
                                     st.warning("Unavailable")
 
                             with choose_col:
-                                already_selected = offer_shop_id == shop_id
-                                st.button(
-                                    "Selected" if already_selected else "Choose",
-                                    key=(
-                                        f"search_offer_choose_"
-                                        f"{product_index}_{offer_index}_"
-                                        f"{offer_shop_id}"
+                                offer_product = {
+                                    **product,
+                                    "product_id": offer.get("product_id"),
+                                    "is_available": offer.get("is_available"),
+                                }
+
+                                render_catalogue_quantity_control(
+                                    offer_shop_id,
+                                    offer_shop_name,
+                                    offer_product,
+                                    key_prefix=(
+                                        f"global_search_{product_index}_"
+                                        f"{offer_index}_{offer_shop_id}"
                                     ),
-                                    disabled=already_selected,
-                                    on_click=select_catalogue_offer_shop,
-                                    args=(
-                                        offer_shop_id,
-                                        offer_shop_name,
-                                    ),
-                                    use_container_width=True,
                                 )
 
                 st.divider()
@@ -1015,8 +1714,12 @@ with st.container(border=True):
                     f"{len(selected_shop_products)} available product(s)"
                 )
 
-                for product, offer in selected_shop_products:
-                    product_col, price_col, status_col = st.columns([4, 2, 2])
+                for product_index, (product, offer) in enumerate(
+                    selected_shop_products
+                ):
+                    product_col, price_col, status_col, action_col = (
+                        st.columns([4, 2, 2, 2])
+                    )
 
                     details = [
                         str(value).strip()
@@ -1042,6 +1745,22 @@ with st.container(border=True):
 
                     with status_col:
                         st.success("Available")
+
+                    with action_col:
+                        offer_product = {
+                            **product,
+                            "product_id": offer.get("product_id"),
+                            "is_available": offer.get("is_available"),
+                        }
+
+                        render_catalogue_quantity_control(
+                            shop_id,
+                            selected_shop_name,
+                            offer_product,
+                            key_prefix=(
+                                f"global_shop_list_{product_index}_{shop_id}"
+                            ),
+                        )
 
                     st.divider()
 
@@ -1087,8 +1806,10 @@ with st.container(border=True):
                     f"{selected_shop_name}"
                 )
 
-                for product in catalogue_items:
-                    product_col, price_col, status_col = st.columns([4, 2, 2])
+                for product_index, product in enumerate(catalogue_items):
+                    product_col, price_col, status_col, action_col = (
+                        st.columns([4, 2, 2, 2])
+                    )
 
                     details = [
                         str(value).strip()
@@ -1120,6 +1841,17 @@ with st.container(border=True):
                         else:
                             st.warning("Unavailable")
 
+                    with action_col:
+                        render_catalogue_quantity_control(
+                            shop_id,
+                            selected_shop_name,
+                            product,
+                            key_prefix=(
+                                f"by_shop_{product_index}_"
+                                f"{product.get('product_id')}"
+                            ),
+                        )
+
                     st.divider()
 
             st.caption(
@@ -1138,7 +1870,7 @@ cart_title_col, add_item_col = st.columns([3, 1])
 with cart_title_col:
     st.markdown("### Your cart")
     st.caption(
-        f"{len(st.session_state.cart_item_ids)} item(s) "
+        f"{_active_cart_item_count()} item(s) "
         "in your shopping cart"
     )
 
@@ -1164,7 +1896,7 @@ for item_id in list(st.session_state.cart_item_ids):
             st.button(
                 "Remove",
                 key=f"remove_cart_item_{item_id}",
-                disabled=len(st.session_state.cart_item_ids) == 1,
+                disabled=False,
                 on_click=remove_cart_item,
                 args=(item_id,),
                 use_container_width=True,
@@ -1175,7 +1907,7 @@ for item_id in list(st.session_state.cart_item_ids):
         with name_col:
             st.text_input(
                 "Product name",
-                value="rice" if item_id == 0 else "",
+                value="",
                 placeholder="e.g. rice, milk, dragon fruit",
                 key=f"cart_{item_id}_name",
             )
@@ -1183,7 +1915,7 @@ for item_id in list(st.session_state.cart_item_ids):
         with normalized_col:
             st.text_input(
                 "Standard product name (optional)",
-                value="Rice" if item_id == 0 else "",
+                value="",
                 placeholder="Optional standardized name",
                 key=f"cart_{item_id}_normalized",
             )
@@ -1194,7 +1926,7 @@ for item_id in list(st.session_state.cart_item_ids):
             st.number_input(
                 "Quantity",
                 min_value=0.0,
-                value=2.0 if item_id == 0 else 0.0,
+                value=0.0,
                 step=1.0,
                 key=f"cart_{item_id}_quantity",
             )
@@ -1202,7 +1934,7 @@ for item_id in list(st.session_state.cart_item_ids):
         with unit_col:
             st.text_input(
                 "Unit",
-                value="kg" if item_id == 0 else "",
+                value="",
                 placeholder="e.g. kg, litre, packet",
                 key=f"cart_{item_id}_unit",
             )
@@ -2102,181 +2834,32 @@ if (
     )
 
 
-# Customer account access
+# Customer account status — sign-in is handled at app entry
 # ---------------------------------------------------------
 
-for _key, _default in (
-    ("customer_access_token", None),
-    ("customer_profile", None),
-    ("order_history_result", None),
-    ("order_lookup_result", None),
-    ("order_lookup_customer_id", None),
-):
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
-
-
-def _customer_error_detail(response, fallback):
-    try:
-        detail = response.json().get("detail", fallback)
-    except ValueError:
-        return fallback
-    if isinstance(detail, dict):
-        detail = detail.get("message", detail)
-    return str(detail)
-
-
-def _clear_customer_session():
-    st.session_state.customer_access_token = None
-    st.session_state.customer_profile = None
-    st.session_state.order_history_result = None
-    st.session_state.order_lookup_result = None
-    st.session_state.order_lookup_customer_id = None
-    st.session_state.saved_order_result = None
-
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile") or {}
 
 st.divider()
-st.markdown("### Your customer account")
-st.caption(
-    "Browsing shops, viewing catalogues and building your cart do not require login. "
-    "Sign in only when you want to save or track your personal orders."
-)
+with st.container(border=True):
+    profile_col, signout_col = st.columns([4, 1])
 
-customer_token = st.session_state.get("customer_access_token")
-customer_profile = st.session_state.get("customer_profile")
-
-if customer_token and customer_profile:
-    with st.container(border=True):
-        account_col, signout_col = st.columns([4, 1])
-        with account_col:
-            st.success(
-                f"Signed in as {customer_profile.get('full_name', 'Customer')}"
-            )
-            st.caption(customer_profile.get("email", ""))
-        with signout_col:
-            st.write("")
-            if st.button("Sign out", key="customer_sign_out_button"):
-                _clear_customer_session()
-                st.rerun()
-else:
-    with st.container(border=True):
-        auth_mode = st.radio(
-            "Customer account",
-            options=("Sign in", "Create account"),
-            horizontal=True,
-            key="customer_auth_mode",
+    with profile_col:
+        st.markdown("### Your customer account")
+        st.success(
+            f"Signed in as {customer_profile.get('full_name', 'Customer')}"
         )
+        st.caption(customer_profile.get("email", ""))
 
-        with st.form("customer_auth_form", clear_on_submit=True):
-            full_name = ""
-            if auth_mode == "Create account":
-                full_name = st.text_input(
-                    "Full name",
-                    max_chars=150,
-                    key="customer_signup_full_name",
-                ).strip()
-
-            customer_email = st.text_input(
-                "Email address",
-                key="customer_auth_email",
-            ).strip()
-            customer_password = st.text_input(
-                "Password",
-                type="password",
-                key="customer_auth_password",
-            )
-            auth_submitted = st.form_submit_button(
-                "Create account" if auth_mode == "Create account" else "Sign in",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if auth_submitted:
-            if not customer_email or not customer_password:
-                st.warning("Enter both your email address and password.")
-            elif auth_mode == "Create account" and not full_name:
-                st.warning("Enter your full name to create an account.")
-            elif auth_mode == "Create account" and len(customer_password) < 12:
-                st.warning("Your password must contain at least 12 characters.")
-            else:
-                try:
-                    with st.spinner("Authenticating your customer account..."):
-                        if auth_mode == "Create account":
-                            register_response = requests.post(
-                                f"{backend_url}/customers/register",
-                                json={
-                                    "full_name": full_name,
-                                    "email": customer_email,
-                                    "password": customer_password,
-                                },
-                                timeout=15,
-                            )
-
-                            if not register_response.ok:
-                                st.error(
-                                    "Account creation failed "
-                                    f"({register_response.status_code}): "
-                                    f"{_customer_error_detail(register_response, 'Could not create your account.')}"
-                                )
-                                register_response = None
-
-                        else:
-                            register_response = True
-
-                        if register_response:
-                            login_response = requests.post(
-                                f"{backend_url}/customers/login",
-                                json={
-                                    "email": customer_email,
-                                    "password": customer_password,
-                                },
-                                timeout=15,
-                            )
-
-                            if not login_response.ok:
-                                st.error(
-                                    "Sign-in failed "
-                                    f"({login_response.status_code}): "
-                                    f"{_customer_error_detail(login_response, 'Could not sign in.')}"
-                                )
-                            else:
-                                token_payload = login_response.json()
-                                access_token = token_payload.get("access_token")
-                                token_type = str(
-                                    token_payload.get("token_type", "bearer")
-                                ).lower()
-
-                                if not access_token or token_type != "bearer":
-                                    st.error(
-                                        "The authentication service returned an invalid customer token."
-                                    )
-                                else:
-                                    profile_response = requests.get(
-                                        f"{backend_url}/customers/me",
-                                        headers={
-                                            "Authorization": f"Bearer {access_token}"
-                                        },
-                                        timeout=15,
-                                    )
-
-                                    if not profile_response.ok:
-                                        st.error(
-                                            "Your credentials were accepted, but your customer profile "
-                                            f"could not be loaded ({profile_response.status_code}): "
-                                            f"{_customer_error_detail(profile_response, 'Profile request failed.')}"
-                                        )
-                                    else:
-                                        st.session_state.customer_access_token = access_token
-                                        st.session_state.customer_profile = profile_response.json()
-                                        st.session_state.order_history_result = None
-                                        st.session_state.order_lookup_result = None
-                                        st.session_state.order_lookup_customer_id = None
-                                        st.session_state.saved_order_result = None
-                                        st.success("Customer account is ready.")
-                                        st.rerun()
-
-                except requests.RequestException as exc:
-                    st.error(f"Could not connect to the customer account service: {exc}")
+    with signout_col:
+        st.write("")
+        if st.button(
+            "Sign out",
+            key="customer_sign_out_button",
+            use_container_width=True,
+        ):
+            _sign_out_customer(cookie_manager, backend_url)
+            st.rerun()
 
 
 # Explicit customer order confirmation

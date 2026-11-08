@@ -34,3 +34,26 @@ class CustomerProfileResponse(BaseModel):
     customer_id: int
     full_name: str
     email: str
+
+
+from backend.models.auth import LoginRequest
+
+
+class CustomerLoginRequest(LoginRequest):
+    """Customer login with optional persistent sign-in."""
+    remember_me: bool = True
+
+
+class CustomerRememberRequest(BaseModel):
+    """Opaque persistent-session token supplied by the browser."""
+
+    remember_token: str = Field(min_length=40, max_length=256)
+
+
+class CustomerLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    remember_token: str | None = None
+    remember_expires_in: int | None = None
+    customer: CustomerProfileResponse | None = None

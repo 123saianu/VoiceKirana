@@ -502,6 +502,54 @@ def _migrate_payment_refunds_schema():
                 )
 
 
+def _migrate_customer_remember_sessions_schema():
+    """Create revocable customer remember-me sessions."""
+
+    with get_connection() as connection:
+        if DATABASE_URL:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_remember_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_id BIGINT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT,
+                    revoked_at TEXT,
+                    FOREIGN KEY (customer_id)
+                        REFERENCES customers(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+        else:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_remember_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT,
+                    revoked_at TEXT,
+                    FOREIGN KEY (customer_id)
+                        REFERENCES customers(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_customer_remember_sessions_customer
+            ON customer_remember_sessions(customer_id)
+            """
+        )
+
+
 def initialize_database():
     """Create the tables required for multi-shop grocery ordering."""
 
@@ -789,6 +837,7 @@ def initialize_database():
 
     # Upgrade existing databases after creating any missing tables.
     _migrate_customer_visibility_schema()
+    _migrate_customer_remember_sessions_schema()
 
     if DATABASE_URL:
         _migrate_postgres_orders_schema()
