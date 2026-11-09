@@ -1,0 +1,68 @@
+services:
+  # FastAPI backend connected to the existing Neon PostgreSQL database.
+  - type: web
+    name: voicekirana-api
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    autoDeployTrigger: checksPass
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python -m backend.database && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: VOICEKIRANA_API_TOKEN
+        generateValue: true
+      - key: VOICEKIRANA_ADMIN_TOKEN
+        generateValue: true
+      - key: GNANI_API_KEY_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: RAZORPAY_MODE
+        value: test
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      # Make the public HTTPS backend URL available to the frontend service.
+      - key: VOICEKIRANA_PUBLIC_API_URL
+        fromService:
+          name: voicekirana-api
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+
+  # Streamlit customer/shop frontend. It calls the backend over HTTPS.
+  - type: web
+    name: voicekirana-web
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    autoDeployTrigger: checksPass
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: streamlit run frontend/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: BACKEND_URL
+        fromService:
+          name: voicekirana-api
+          type: web
+          envVarKey: VOICEKIRANA_PUBLIC_API_URL
+      - key: VOICEKIRANA_API_TOKEN
+        fromService:
+          name: voicekirana-api
+          type: web
+          envVarKey: VOICEKIRANA_API_TOKEN
+      - key: VOICEKIRANA_COOKIE_SECURE
+        value: "true"
