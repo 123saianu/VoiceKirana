@@ -785,6 +785,22 @@ def _save_confirmed_order(
 
     with get_connection() as connection:
         with connection:
+            shop_policy = connection.execute(
+                """
+                SELECT auto_accept_orders
+                FROM shops
+                WHERE id = ? AND is_active = 1
+                """,
+                (shop_id,),
+            ).fetchone()
+
+            if shop_policy is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active shop not found.",
+                )
+
+            auto_accept = bool(shop_policy["auto_accept_orders"])
 
             # Claim the confirmation key inside the same transaction
             # that will create the order.
@@ -894,12 +910,121 @@ def _save_confirmed_order(
                     """,
                     (order_id, customer_id),
                 )
+
+            order_status = "pending"
+            stock_reserved = False
+            reserved_items = []
+
+            if auto_accept:
+                # Re-read and reserve stock inside this transaction. The
+                # conditional UPDATE prevents overselling if stock changed
+                # after the initial inventory check. Any failure rolls back
+                # the order, ownership link, idempotency row and reservations.
+                reservation_rows = connection.execute(
+                    """
+                    SELECT
+                        oi.product_id,
+                        p.name AS product_name,
+                        SUM(oi.quantity) AS requested_quantity
+                    FROM order_items AS oi
+                    JOIN products AS p ON p.id = oi.product_id
+                    WHERE oi.order_id = ?
+                    GROUP BY oi.product_id, p.name
+                    ORDER BY oi.product_id
+                    """,
+                    (order_id,),
+                ).fetchall()
+
+                if not reservation_rows:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The order has no inventory items to reserve.",
+                    )
+
+                for item in reservation_rows:
+                    quantity = float(item["requested_quantity"])
+                    cursor = connection.execute(
+                        """
+                        UPDATE inventory
+                        SET reserved_quantity = reserved_quantity + ?
+                        WHERE shop_id = ?
+                          AND product_id = ?
+                          AND is_available = 1
+                          AND stock_quantity - reserved_quantity >= ?
+                        """,
+                        (quantity, shop_id, item["product_id"], quantity),
+                    )
+
+                    if cursor.rowcount != 1:
+                        stock = connection.execute(
+                            """
+                            SELECT stock_quantity, reserved_quantity, is_available
+                            FROM inventory
+                            WHERE shop_id = ? AND product_id = ?
+                            """,
+                            (shop_id, item["product_id"]),
+                        ).fetchone()
+
+                        available = 0.0
+                        if stock is not None and stock["is_available"]:
+                            available = max(
+                                0.0,
+                                float(stock["stock_quantity"])
+                                - float(stock["reserved_quantity"]),
+                            )
+
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "message": (
+                                    "Automatic order confirmation could not reserve "
+                                    "all requested stock. No order was saved; "
+                                    "please review availability and try again."
+                                ),
+                                "product_name": item["product_name"],
+                                "available_quantity": available,
+                                "requested_quantity": quantity,
+                            },
+                        )
+
+                    reserved_items.append({
+                        "product_id": item["product_id"],
+                        "product_name": item["product_name"],
+                        "reserved_quantity": quantity,
+                    })
+
+                status_update = connection.execute(
+                    """
+                    UPDATE orders
+                    SET status = 'confirmed'
+                    WHERE id = ?
+                      AND shop_id = ?
+                      AND status = 'pending'
+                    """,
+                    (order_id, shop_id),
+                )
+
+                if status_update.rowcount != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The order status changed before automatic "
+                            "confirmation completed. No order was saved."
+                        ),
+                    )
+
+                order_status = "confirmed"
+                stock_reserved = True
+
             response = {
-                "status": "pending",
+                "status": order_status,
                 "message": (
-                    "The order request has been saved. "
-                    "Shop acceptance is not yet confirmed, and stock "
-                    "has not been reserved."
+                    "The order was automatically confirmed and inventory was reserved."
+                    if auto_accept
+                    else (
+                        "The order request has been saved. Shop acceptance is "
+                        "not yet confirmed, and stock has not been reserved."
+                    )
                 ),
                 "order_id": order_id,
                 "order_reference": order_reference,
@@ -908,7 +1033,9 @@ def _save_confirmed_order(
                 "total_paise": total_paise,
                 "total_rupees": round(total_paise / 100, 2),
                 "items": checked_items,
-                "stock_reserved": False,
+                "stock_reserved": stock_reserved,
+                "acceptance_mode": "automatic" if auto_accept else "manual",
+                "reserved_items": reserved_items,
             }
 
             # Store the original response before committing.
@@ -1152,6 +1279,65 @@ def _load_order_details(connection, order_row):
             for item in item_rows
         ],
     }
+
+def _load_customer_order_details(connection, order_row, customer_id):
+    """Add the authenticated customer's latest payment summary to an order."""
+
+    details = _load_order_details(connection, order_row)
+
+    payment = connection.execute(
+        """
+        SELECT
+            id,
+            razorpay_order_id,
+            amount_paise,
+            amount_refunded_paise,
+            currency,
+            status,
+            updated_at
+        FROM payments
+        WHERE order_id = ?
+          AND customer_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (order_row["id"], customer_id),
+    ).fetchone()
+
+    if payment is None:
+        details["payment"] = {
+            "payment_id": None,
+            "status": "not_started",
+            "amount_paise": None,
+            "amount_refunded_paise": 0,
+            "currency": "INR",
+            "updated_at": None,
+            "razorpay_order_id": None,
+            "key_id": None,
+        }
+        return details
+
+    key_id = None
+
+    # Only an existing Checkout session needs the public Razorpay Key ID.
+    if payment["status"] == "created" and payment["razorpay_order_id"]:
+        try:
+            key_id = get_razorpay_public_key_id()
+        except RazorpayConfigurationError:
+            key_id = None
+
+    details["payment"] = {
+        "payment_id": payment["id"],
+        "status": payment["status"],
+        "amount_paise": payment["amount_paise"],
+        "amount_refunded_paise": payment["amount_refunded_paise"],
+        "currency": payment["currency"],
+        "updated_at": payment["updated_at"],
+        "razorpay_order_id": payment["razorpay_order_id"],
+        "key_id": key_id,
+    }
+
+    return details
 
 
 @app.get("/orders/{order_reference}")
@@ -2461,7 +2647,11 @@ def get_customer_order_history(
         ).fetchall()
 
         orders = [
-            _load_order_details(connection, order_row)
+            _load_customer_order_details(
+                connection,
+                order_row,
+                customer_id,
+            )
             for order_row in order_rows
         ]
 
@@ -2508,7 +2698,11 @@ def get_customer_order(
                 detail="Order not found.",
             )
 
-        return _load_order_details(connection, order_row)
+        return _load_customer_order_details(
+            connection,
+            order_row,
+            customer_id,
+        )
 
 @app.post(
     "/customers/orders/{order_reference}/payments",

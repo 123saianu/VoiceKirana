@@ -410,6 +410,49 @@ def _migrate_customer_visibility_schema():
                 )
 
 
+def _migrate_shop_auto_accept_schema():
+    """Add per-shop automatic order acceptance, disabled by default."""
+
+    with get_connection() as connection:
+        if DATABASE_URL:
+            column = connection.execute(
+                """
+                SELECT 1 AS present
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'shops'
+                  AND column_name = 'auto_accept_orders'
+                """
+            ).fetchone()
+
+            if column is None:
+                connection.execute(
+                    """
+                    ALTER TABLE shops
+                    ADD COLUMN auto_accept_orders INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (auto_accept_orders IN (0, 1))
+                    """
+                )
+        else:
+            columns = connection.execute(
+                "PRAGMA table_info(shops)"
+            ).fetchall()
+
+            if not any(
+                row["name"] == "auto_accept_orders"
+                for row in columns
+            ):
+                connection.execute(
+                    """
+                    ALTER TABLE shops
+                    ADD COLUMN auto_accept_orders INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK (auto_accept_orders IN (0, 1))
+                    """
+                )
+
+
 def _migrate_inventory_reservations_schema():
     """Add reserved stock tracking to existing SQLite/PostgreSQL databases."""
     with get_connection() as connection:
@@ -672,6 +715,8 @@ def initialize_database():
             CHECK (is_active IN (0, 1)),
         is_customer_visible INTEGER NOT NULL DEFAULT 0
             CHECK (is_customer_visible IN (0, 1)),
+        auto_accept_orders INTEGER NOT NULL DEFAULT 0
+            CHECK (auto_accept_orders IN (0, 1)),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -948,6 +993,7 @@ def initialize_database():
 
     # Upgrade existing databases after creating any missing tables.
     _migrate_customer_visibility_schema()
+    _migrate_shop_auto_accept_schema()
     _migrate_customer_remember_sessions_schema()
     _migrate_customer_profile_schema()
 

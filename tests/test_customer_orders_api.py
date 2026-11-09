@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import database
+from backend import main as main_module
 from backend.main import app
 from backend.services.inventory_service import (
     create_shop,
@@ -161,6 +162,7 @@ def test_customer_can_confirm_order_and_view_it(client):
     assert saved["status"] == "pending"
     assert saved["total_paise"] == 6800
     assert saved["stock_reserved"] is False
+    assert saved["acceptance_mode"] == "manual"
 
     history = client.get(
         "/customers/orders",
@@ -170,6 +172,10 @@ def test_customer_can_confirm_order_and_view_it(client):
     assert history.status_code == 200
     assert history.json()["customer_id"] == customer["customer_id"]
     assert history.json()["count"] == 1
+    history_order = history.json()["orders"][0]
+    assert history_order["payment"]["status"] == "not_started"
+    assert history_order["payment"]["amount_refunded_paise"] == 0
+    assert history_order["payment"]["razorpay_order_id"] is None
 
     order = client.get(
         f"/customers/orders/{saved['order_reference']}",
@@ -179,6 +185,8 @@ def test_customer_can_confirm_order_and_view_it(client):
     assert order.status_code == 200
     assert order.json()["order_reference"] == saved["order_reference"]
     assert order.json()["items"][0]["product_name"] == "Rice"
+    assert order.json()["payment"]["status"] == "not_started"
+    assert order.json()["payment"]["amount_refunded_paise"] == 0
 
     with closing(database.get_connection()) as connection:
         ownership = connection.execute(
@@ -424,3 +432,165 @@ def test_customer_invalid_idempotency_key_is_rejected(client):
     assert response.status_code == 400
 
     print("PASS: Empty idempotency key rejected")
+
+
+
+def _enable_auto_accept_for_shop(shop_id):
+    with closing(database.get_connection()) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE shops SET auto_accept_orders = 1 WHERE id = ?",
+                (shop_id,),
+            )
+
+
+def test_auto_accept_shop_confirms_customer_order_and_reserves_stock(client):
+    shop_id = create_test_inventory()
+    _enable_auto_accept_for_shop(shop_id)
+    customer = register_and_login(client, "auto-accept@example.com")
+
+    response = place_customer_order(
+        client,
+        shop_id,
+        customer,
+        "auto-accept-customer-order-001",
+    )
+
+    assert response.status_code == 201
+    saved = response.json()
+    assert saved["status"] == "confirmed"
+    assert saved["stock_reserved"] is True
+    assert saved["acceptance_mode"] == "automatic"
+    assert saved["reserved_items"][0]["reserved_quantity"] == 1
+
+    with closing(database.get_connection()) as connection:
+        inventory = connection.execute(
+            """
+            SELECT stock_quantity, reserved_quantity
+            FROM inventory
+            WHERE shop_id = ?
+            """,
+            (shop_id,),
+        ).fetchone()
+
+        order_row = connection.execute(
+            "SELECT status FROM orders WHERE id = ?",
+            (saved["order_id"],),
+        ).fetchone()
+
+    assert order_row["status"] == "confirmed"
+    assert float(inventory["stock_quantity"]) == 20.0
+    assert float(inventory["reserved_quantity"]) == 1.0
+
+    detail = client.get(
+        f"/customers/orders/{saved['order_reference']}",
+        headers=customer["headers"],
+    )
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "confirmed"
+    assert detail.json()["payment"]["status"] == "not_started"
+
+
+def test_auto_accept_rolls_back_if_stock_changes_before_reservation(
+    client,
+    monkeypatch,
+):
+    shop_id = create_test_inventory()
+    _enable_auto_accept_for_shop(shop_id)
+    customer = register_and_login(client, "auto-accept-stock-race@example.com")
+
+    original_check = main_module._check_inventory_for_order
+
+    def check_then_stock_disappears(order, shop_id):
+        result = original_check(order=order, shop_id=shop_id)
+        product_id = result["items"][0]["product_id"]
+        with closing(database.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE inventory
+                    SET stock_quantity = 0
+                    WHERE shop_id = ? AND product_id = ?
+                    """,
+                    (shop_id, product_id),
+                )
+        return result
+
+    monkeypatch.setattr(
+        main_module,
+        "_check_inventory_for_order",
+        check_then_stock_disappears,
+    )
+
+    response = place_customer_order(
+        client,
+        shop_id,
+        customer,
+        "auto-accept-stock-race-001",
+    )
+
+    assert response.status_code == 409
+    assert "No order was saved" in response.json()["detail"]["message"]
+
+    with closing(database.get_connection()) as connection:
+        order_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM orders"
+        ).fetchone()["total"]
+        ownership_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM customer_order_ownership"
+        ).fetchone()["total"]
+        idempotency_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM order_idempotency"
+        ).fetchone()["total"]
+        inventory = connection.execute(
+            "SELECT reserved_quantity FROM inventory WHERE shop_id = ?",
+            (shop_id,),
+        ).fetchone()
+
+    assert order_count == 0
+    assert ownership_count == 0
+    assert idempotency_count == 0
+    assert float(inventory["reserved_quantity"]) == 0.0
+
+
+def test_auto_accept_idempotent_retry_does_not_reserve_stock_twice(client):
+    shop_id = create_test_inventory()
+    _enable_auto_accept_for_shop(shop_id)
+    customer = register_and_login(client, "auto-retry@example.com")
+
+    first = place_customer_order(
+        client,
+        shop_id,
+        customer,
+        "auto-accept-retry-001",
+    )
+
+    second = place_customer_order(
+        client,
+        shop_id,
+        customer,
+        "auto-accept-retry-001",
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["order_reference"] == second.json()["order_reference"]
+    assert second.json()["status"] == "confirmed"
+    assert second.json()["stock_reserved"] is True
+
+    with closing(database.get_connection()) as connection:
+        order_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM orders"
+        ).fetchone()["total"]
+
+        reservation = connection.execute(
+            """
+            SELECT reserved_quantity
+            FROM inventory
+            WHERE shop_id = ?
+            """,
+            (shop_id,),
+        ).fetchone()
+
+    assert order_count == 1
+    assert float(reservation["reserved_quantity"]) == 1.0

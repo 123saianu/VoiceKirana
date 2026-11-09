@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
+from frontend.razorpay_checkout import render_razorpay_checkout
 from backend.services.timbre_service import (
     synthesize_speech,
     TimbreError,
@@ -3283,13 +3283,37 @@ with st.container(border=True):
                     )
 
                 if confirm_response.ok:
-                    st.session_state.saved_order_result = confirm_response.json()
+                    saved_order = confirm_response.json()
+                    st.session_state.saved_order_result = saved_order
                     st.session_state.pending_order_payload = None
                     st.session_state.pending_shop_id = None
                     st.session_state.pending_idempotency_key = None
                     st.session_state.order_history_result = None
                     st.session_state.order_lookup_result = None
                     st.session_state.order_lookup_customer_id = None
+
+                    # Automatically load confirmed orders so the customer
+                    # can see the Razorpay payment action without a second lookup.
+                    if saved_order.get("status") == "confirmed":
+                        try:
+                            detail_response = requests.get(
+                                (
+                                    f"{backend_url}/customers/orders/"
+                                    f"{quote(str(saved_order.get('order_reference', '')), safe='')}"
+                                ),
+                                headers={"Authorization": f"Bearer {customer_token}"},
+                                timeout=15,
+                            )
+                            if detail_response.ok:
+                                st.session_state.order_lookup_result = detail_response.json()
+                                st.session_state.order_lookup_customer_id = (
+                                    st.session_state.get("customer_profile") or {}
+                                ).get("customer_id")
+                        except requests.RequestException:
+                            # The customer can still find the saved order using
+                            # Track an order if this immediate refresh is unavailable.
+                            pass
+
                     st.rerun()
                 elif confirm_response.status_code == 401:
                     _clear_customer_session()
@@ -3307,7 +3331,11 @@ with st.container(border=True):
         saved = st.session_state.saved_order_result
         rupee = chr(0x20B9)
 
-        st.success("Your customer order request has been saved successfully.")
+        saved_status = str(saved.get("status", "pending")).lower()
+        if saved_status == "confirmed" and saved.get("stock_reserved"):
+            st.success("Your order has been confirmed automatically and saved successfully.")
+        else:
+            st.success("Your customer order request has been saved successfully.")
         reference_col, status_col = st.columns(2)
 
         with reference_col:
@@ -3322,10 +3350,16 @@ with st.container(border=True):
             "Saved order total",
             f"{rupee}{float(saved['total_rupees']):,.2f}",
         )
-        st.info(
-            "This is a saved pending order request. Stock is not reserved, "
-            "and shop acceptance has not been confirmed."
-        )
+        if saved_status == "confirmed" and saved.get("stock_reserved"):
+            st.info(
+                "Stock has been reserved automatically. Your order is ready for payment; "
+                "the Razorpay Checkout option is available below."
+            )
+        else:
+            st.info(
+                "This is a saved pending order request. Stock is not reserved, "
+                "and shop acceptance has not been confirmed."
+            )
 
     else:
         st.info(
@@ -3435,7 +3469,59 @@ if (
                     "Order total",
                     f"{rupee}{float(saved_order.get('total_rupees', 0)):,.2f}",
                 )
-                st.caption(f"Created: {saved_order.get('created_at', 'Unknown')}")
+
+                payment = saved_order.get("payment") or {}
+                payment_status = str(
+                    payment.get("status", "not_started")
+                ).lower()
+
+                payment_labels = {
+                    "not_started": "Not started",
+                    "creating": "Payment setup in progress",
+                    "created": "Awaiting payment",
+                    "authorized": "Authorized - awaiting capture",
+                    "captured": "Paid successfully",
+                    "failed": "Payment failed",
+                    "creation_failed": "Payment setup failed",
+                    "refunded": "Refunded",
+                }
+
+                payment_label = payment_labels.get(
+                    payment_status,
+                    payment_status.replace("_", " ").title(),
+                )
+
+                st.caption("PAYMENT STATUS")
+
+                if payment_status == "captured":
+                    st.success(payment_label)
+                elif payment_status == "refunded":
+                    st.info(payment_label)
+                elif payment_status in {"failed", "creation_failed"}:
+                    st.error(payment_label)
+                elif payment_status == "not_started":
+                    st.info(payment_label)
+                else:
+                    st.warning(payment_label)
+
+                refunded_paise = int(
+                    payment.get("amount_refunded_paise") or 0
+                )
+
+                if refunded_paise > 0:
+                    refund_label = (
+                        "Total refunded"
+                        if payment_status == "refunded"
+                        else "Refunded so far"
+                    )
+                    st.caption(
+                        f"{refund_label}: "
+                        f"{rupee}{refunded_paise / 100:.2f}"
+                    )
+
+                st.caption(
+                    f"Created: {saved_order.get('created_at', 'Unknown')}"
+                )
 
                 with st.expander("View ordered products"):
                     for saved_item in saved_order.get("items", []):
@@ -3595,3 +3681,334 @@ if (
             st.info("This order has been cancelled.")
         elif status_normalized == "rejected":
             st.info("The shop rejected this order. Check the shop response above for details.")
+        # ---------------------------------------------------------
+        # Customer payment section
+        # ---------------------------------------------------------
+
+        payment = lookup_result.get("payment") or {}
+        payment_status = str(payment.get("status", "not_started")).lower()
+
+        payment_labels = {
+            "not_started": "Not started",
+            "creating": "Payment setup in progress",
+            "created": "Awaiting payment",
+            "authorized": "Authorized - awaiting capture",
+            "captured": "Paid successfully",
+            "failed": "Payment failed",
+            "creation_failed": "Payment setup failed",
+            "refunded": "Refunded",
+        }
+
+        st.divider()
+        st.markdown("**Payment details**")
+        st.write(
+            f"Payment status: "
+            f"**{payment_labels.get(payment_status, payment_status.replace('_', ' ').title())}**"
+        )
+
+        refunded_paise = int(payment.get("amount_refunded_paise") or 0)
+        if refunded_paise > 0:
+            st.caption(
+                f"Refunded amount: {rupee}{refunded_paise / 100:,.2f}"
+            )
+
+        if payment_status == "captured":
+            st.success("Your payment has been captured successfully.")
+        elif payment_status == "authorized":
+            st.info("Your payment is authorized and awaiting capture.")
+        elif payment_status == "creating":
+            st.warning(
+                "Payment setup is still being processed. "
+                "Please refresh the order status before trying again."
+            )
+        elif payment_status == "failed":
+            st.warning(
+                "The previous payment attempt failed. You can start another attempt."
+            )
+        elif payment_status == "creation_failed":
+            st.warning(
+                "The previous payment setup failed. You can try again."
+            )
+        elif payment_status == "refunded":
+            st.info("This payment has been refunded.")
+
+        # Payment is available only after shop confirmation.
+        if status_normalized == "confirmed":
+            if payment_status in (
+                "not_started",
+                "failed",
+                "creation_failed",
+            ):
+                payment_key_id = (
+                    f"{current_customer_id}:"
+                    f"{lookup_result.get('order_reference', '')}"
+                )
+
+                idempotency_keys = st.session_state.setdefault(
+                    "customer_payment_idempotency_keys", {}
+                )
+
+                # A new attempt needs a new idempotency key after a
+                # previously recorded failed attempt.
+                if payment_status in ("failed", "creation_failed"):
+                    idempotency_keys.pop(payment_key_id, None)
+
+                if st.button(
+                    "Pay securely with Razorpay",
+                    key=f"pay_order_{lookup_result.get('order_reference')}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    if not customer_token:
+                        st.error("Please sign in again to make this payment.")
+                    else:
+                        idempotency_key = idempotency_keys.get(payment_key_id)
+
+                        if not idempotency_key:
+                            idempotency_key = uuid.uuid4().hex
+                            idempotency_keys[payment_key_id] = idempotency_key
+
+                        try:
+                            with st.spinner("Preparing your secure payment..."):
+                                payment_response = requests.post(
+                                    (
+                                        f"{backend_url}/customers/orders/"
+                                        f"{quote(str(lookup_result.get('order_reference', '')), safe='')}"
+                                        "/payments"
+                                    ),
+                                    headers={
+                                        "Authorization": f"Bearer {customer_token}",
+                                        "Idempotency-Key": idempotency_key,
+                                    },
+                                    timeout=30,
+                                )
+
+                            if payment_response.ok:
+                                payment_data = payment_response.json()
+
+                                lookup_result["payment"] = {
+                                    "payment_id": payment_data["payment_id"],
+                                    "status": payment_data["status"],
+                                    "amount_paise": payment_data["amount_paise"],
+                                    "amount_refunded_paise": 0,
+                                    "currency": payment_data["currency"],
+                                    "razorpay_order_id": payment_data["razorpay_order_id"],
+                                    "key_id": payment_data.get("key_id"),
+                                }
+
+                                st.session_state.order_lookup_result = lookup_result
+                                st.rerun()
+
+                            elif payment_response.status_code == 401:
+                                _clear_customer_session()
+                                st.error("Your customer session expired. Please sign in again.")
+
+                            else:
+                                st.error(
+                                    f"Could not prepare payment "
+                                    f"({payment_response.status_code}): "
+                                    f"{_customer_error_detail(payment_response, 'Payment setup failed.')}"
+                                )
+
+                        except requests.RequestException as exc:
+                            st.error(
+                                "Could not connect to the payment service. "
+                                f"Please refresh the order status before retrying. Details: {exc}"
+                            )
+                        except (ValueError, KeyError) as exc:
+                            st.error(
+                                f"The payment service returned an unexpected response: {exc}"
+                            )
+
+        elif status_normalized in ("pending", "rejected", "cancelled"):
+            st.info(
+                "Payment is unavailable until the shop confirms the order."
+            )
+        # ---------------------------------------------------------
+        # Razorpay Checkout and server-side payment verification
+        # ---------------------------------------------------------
+
+        def _refresh_customer_order_status():
+            try:
+                refreshed_response = requests.get(
+                    (
+                        f"{backend_url}/customers/orders/"
+                        f"{quote(str(lookup_result.get('order_reference', '')), safe='')}"
+                    ),
+                    headers={"Authorization": f"Bearer {customer_token}"},
+                    timeout=15,
+                )
+
+                if refreshed_response.ok:
+                    refreshed_order = refreshed_response.json()
+                    st.session_state.order_lookup_result = refreshed_order
+                    st.session_state.order_lookup_customer_id = current_customer_id
+                    return True
+
+                if refreshed_response.status_code == 401:
+                    _clear_customer_session()
+                    st.error("Your customer session expired. Please sign in again.")
+                else:
+                    st.error(
+                        f"Could not refresh order status "
+                        f"({refreshed_response.status_code})."
+                    )
+
+            except requests.RequestException as exc:
+                st.error(f"Could not refresh order status: {exc}")
+
+            return False
+
+        if status_normalized == "confirmed" and payment_status == "created":
+            checkout_payment_id = payment.get("payment_id")
+            checkout_order_id = payment.get("razorpay_order_id")
+            checkout_key_id = payment.get("key_id")
+
+            try:
+                checkout_amount_paise = int(payment.get("amount_paise") or 0)
+            except (TypeError, ValueError):
+                checkout_amount_paise = 0
+
+            if not checkout_payment_id or not checkout_order_id or not checkout_key_id:
+                st.error(
+                    "Checkout details are incomplete. Refresh the order status "
+                    "or contact support."
+                )
+            elif checkout_amount_paise <= 0:
+                st.error("The payment amount is invalid. Checkout cannot be opened.")
+            else:
+                customer_name = str(customer_profile.get("full_name") or "")
+                customer_email = str(customer_profile.get("email") or "")
+
+                checkout_data = {
+                    "payment_id": checkout_payment_id,
+                    "order_reference": str(lookup_result.get("order_reference", "")),
+                    "razorpay_order_id": str(checkout_order_id),
+                    "key_id": str(checkout_key_id),
+                    "amount_paise": checkout_amount_paise,
+                    "currency": str(payment.get("currency") or "INR"),
+                    "customer_name": customer_name,
+                    "customer_email": customer_email,
+                    "customer_phone": "",
+                    "prefill": {
+                        "name": customer_name,
+                        "email": customer_email,
+                        "contact": "",
+                    },
+                }
+
+                checkout_result = render_razorpay_checkout(
+                    checkout_data,
+                    component_key=(
+                        f"razorpay_checkout_{current_customer_id}_"
+                        f"{checkout_payment_id}"
+                    ),
+                )
+
+                success_event = checkout_result.payment_success
+                failed_event = checkout_result.payment_failed
+                dismissed_event = checkout_result.payment_dismissed
+                checkout_error_event = checkout_result.checkout_error
+
+                if success_event:
+                    if (
+                        str(success_event.get("payment_id"))
+                        != str(checkout_payment_id)
+                    ):
+                        st.error(
+                            "The payment response does not match this order's "
+                            "active payment attempt."
+                        )
+                    elif (
+                        success_event.get("razorpay_order_id")
+                        != str(checkout_order_id)
+                    ):
+                        st.error("The payment response contains an unexpected order ID.")
+                    else:
+                        try:
+                            with st.spinner("Verifying payment securely..."):
+                                verify_response = requests.post(
+                                    (
+                                        f"{backend_url}/customers/orders/"
+                                        f"{quote(str(lookup_result.get('order_reference', '')), safe='')}"
+                                        "/payments/verify"
+                                    ),
+                                    headers={
+                                        "Authorization": f"Bearer {customer_token}"
+                                    },
+                                    json={
+                                        "razorpay_payment_id": success_event.get(
+                                            "razorpay_payment_id"
+                                        ),
+                                        "razorpay_order_id": success_event.get(
+                                            "razorpay_order_id"
+                                        ),
+                                        "razorpay_signature": success_event.get(
+                                            "razorpay_signature"
+                                        ),
+                                    },
+                                    timeout=30,
+                                )
+
+                            if verify_response.ok:
+                                verification_data = verify_response.json()
+
+                                if verification_data.get("captured") is True:
+                                    st.success("Payment verified and captured.")
+                                else:
+                                    st.info(
+                                        "Payment verification completed. "
+                                        "The payment is not yet captured."
+                                    )
+
+                                if _refresh_customer_order_status():
+                                    st.rerun()
+
+                            elif verify_response.status_code == 401:
+                                _clear_customer_session()
+                                st.error(
+                                    "Your customer session expired. Please sign in again."
+                                )
+                            else:
+                                st.error(
+                                    f"Payment verification failed "
+                                    f"({verify_response.status_code}): "
+                                    f"{_customer_error_detail(verify_response, 'Could not verify payment.')}"
+                                )
+
+                        except (requests.RequestException, ValueError) as exc:
+                            st.error(
+                                "Could not complete payment verification. "
+                                f"Refresh the order status before taking another action. {exc}"
+                            )
+
+                elif failed_event:
+                    failure_description = str(
+                        failed_event.get("description") or "Payment was not completed."
+                    )
+                    st.warning(
+                        f"Razorpay reported a payment failure: {failure_description}"
+                    )
+                    st.caption(
+                        "Refresh the payment status to check the backend's latest record."
+                    )
+
+                elif dismissed_event:
+                    st.info(
+                        "Checkout was closed. Your payment status has not been "
+                        "assumed to be failed."
+                    )
+
+                elif checkout_error_event:
+                    st.error(
+                        "Checkout could not be opened: "
+                        f"{checkout_error_event.get('message', 'Unknown error')}"
+                    )
+
+        if st.button(
+            "Refresh order and payment status",
+            key=f"refresh_order_status_{lookup_result.get('order_reference')}",
+            use_container_width=True,
+        ):
+            if _refresh_customer_order_status():
+                st.rerun()

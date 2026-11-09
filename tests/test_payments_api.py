@@ -336,7 +336,22 @@ def test_customer_can_create_razorpay_payment(
     assert payment["razorpay_order_id"] == "order_test123"
     assert payment["amount_paise"] == 6800
     assert payment["status"] == "created"
+    order_response = client.get(
+        f"/customers/orders/{order['order_reference']}",
+        headers=customer["headers"],
+    )
 
+    assert order_response.status_code == 200
+
+    payment_summary = order_response.json()["payment"]
+
+    assert payment_summary["payment_id"] == result["payment_id"]
+    assert payment_summary["status"] == "created"
+    assert payment_summary["amount_paise"] == 6800
+    assert payment_summary["amount_refunded_paise"] == 0
+    assert payment_summary["currency"] == "INR"
+    assert payment_summary["razorpay_order_id"] == "order_test123"
+    assert payment_summary["key_id"] == TEST_PUBLIC_KEY
     print("PASS: Customer payment order creation and persistence")
 
 
