@@ -164,6 +164,18 @@ st.markdown(
             min-height: 46px;
         }
     }
+    .st-key-customer_account_menu button {
+        width: 44px !important;
+        min-width: 44px !important;
+        height: 44px !important;
+        min-height: 44px !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -530,6 +542,423 @@ if not customer_token or not customer_profile:
 # ---------------------------------------------------------
 # Authenticated customer — main application is now unlocked
 # ---------------------------------------------------------
+
+
+# Customer account menu — profile and saved delivery addresses
+# ------------------------------------------------------------
+customer_token = st.session_state.get("customer_access_token")
+customer_profile = st.session_state.get("customer_profile") or {}
+
+# Login returns a compact profile; fetch the complete profile once per token.
+if (
+    customer_token
+    and st.session_state.get("customer_profile_details_loaded_token")
+    != customer_token
+):
+    try:
+        complete_profile_response = requests.get(
+            f"{backend_url}/customers/me",
+            headers={
+                "Authorization": f"Bearer {customer_token}"
+            },
+            timeout=15,
+        )
+
+        if complete_profile_response.ok:
+            customer_profile = complete_profile_response.json()
+            st.session_state.customer_profile = customer_profile
+            st.session_state.customer_profile_details_loaded_token = (
+                customer_token
+            )
+        elif complete_profile_response.status_code == 401:
+            _clear_customer_session()
+            st.error("Your session expired. Please sign in again.")
+            st.rerun()
+        else:
+            st.warning("Some profile details could not be loaded.")
+
+    except requests.RequestException:
+        st.warning("Could not refresh your customer profile.")
+
+customer_profile = st.session_state.get("customer_profile") or {}
+customer_id = customer_profile.get("customer_id")
+if customer_token:
+    with st.container(
+        horizontal=True,
+        horizontal_alignment="right",
+        vertical_alignment="center",
+        key="customer_account_menu",
+    ):
+        with st.popover(
+            "👤",
+            help="My account",
+            type="secondary",
+            width="content",
+        ):
+            st.markdown("### Customer profile")
+            st.caption(customer_profile.get("email", ""))
+
+            with st.form("customer_profile_update_form"):
+                updated_name = st.text_input(
+                    "Full name",
+                    value=customer_profile.get("full_name", ""),
+                    max_chars=150,
+                )
+                updated_phone = st.text_input(
+                    "Phone number",
+                    value=customer_profile.get("phone") or "",
+                    max_chars=20,
+                )
+                language_options = {
+                    "English (India)": "en-IN",
+                    "Telugu (India)": "te-IN",
+                    "Hindi (India)": "hi-IN",
+                    "Tamil (India)": "ta-IN",
+                    "Kannada (India)": "kn-IN",
+                    "Malayalam (India)": "ml-IN",
+                }
+                current_language = customer_profile.get(
+                    "preferred_language", "en-IN"
+                )
+                language_labels = list(language_options.keys())
+                selected_language = next(
+                    (
+                        label
+                        for label, code in language_options.items()
+                        if code == current_language
+                    ),
+                    "English (India)",
+                )
+                chosen_language = st.selectbox(
+                    "Preferred language",
+                    options=language_labels,
+                    index=language_labels.index(selected_language),
+                )
+
+                save_profile = st.form_submit_button(
+                    "Save profile",
+                    use_container_width=True,
+                )
+
+            if save_profile:
+                try:
+                    profile_response = requests.patch(
+                        f"{backend_url}/customers/me",
+                        json={
+                            "full_name": updated_name,
+                            "phone": updated_phone.strip() or None,
+                            "preferred_language": language_options[chosen_language],
+                        },
+                        headers={
+                            "Authorization": f"Bearer {customer_token}"
+                        },
+                        timeout=15,
+                    )
+
+                    if profile_response.ok:
+                        st.session_state.customer_profile = (
+                            profile_response.json()
+                        )
+                        st.success("Your profile has been updated.")
+                        st.rerun()
+                    else:
+                        st.error(
+                            _customer_error_detail(
+                                profile_response,
+                                "Could not update your profile.",
+                            )
+                        )
+                except requests.RequestException as exc:
+                    st.error(f"Profile update failed: {exc}")
+
+            st.divider()
+            st.markdown("### Saved delivery addresses")
+
+            # Keep the address cache tied to the currently signed-in customer.
+            if (
+                st.session_state.get("customer_addresses_customer_id")
+                != customer_id
+            ):
+                st.session_state.customer_addresses_customer_id = customer_id
+                st.session_state.customer_addresses = None
+
+            if st.session_state.get("customer_addresses") is None:
+                try:
+                    address_response = requests.get(
+                        f"{backend_url}/customers/addresses",
+                        headers={
+                            "Authorization": f"Bearer {customer_token}"
+                        },
+                        timeout=15,
+                    )
+
+                    if address_response.ok:
+                        st.session_state.customer_addresses = (
+                            address_response.json()
+                        )
+                    elif address_response.status_code == 401:
+                        _clear_customer_session()
+                        st.error("Your session expired. Please sign in again.")
+                        st.rerun()
+                    else:
+                        st.error(
+                            _customer_error_detail(
+                                address_response,
+                                "Could not load saved addresses.",
+                            )
+                        )
+                except requests.RequestException as exc:
+                    st.error(f"Address loading failed: {exc}")
+
+            def refresh_customer_addresses():
+                try:
+                    response = requests.get(
+                        f"{backend_url}/customers/addresses",
+                        headers={
+                            "Authorization": f"Bearer {customer_token}"
+                        },
+                        timeout=15,
+                    )
+                    response.raise_for_status()
+                    st.session_state.customer_addresses = response.json()
+
+                except (requests.RequestException, ValueError):
+                    # The address mutation may have succeeded even if refreshing fails.
+                    # Clear the cache so the next rerun attempts to load the latest data.
+                    st.session_state.customer_addresses = None
+
+            addresses = st.session_state.get("customer_addresses")
+
+            if addresses:
+                for address in addresses:
+                    address_id = address["address_id"]
+
+                    with st.expander(
+                        f"{address['label']} "
+                        + ("⭐ Default address" if address["is_default"] else "")
+                    ):
+                        st.write(f"**{address['recipient_name']}**")
+                        st.write(address["phone"])
+                        st.write(address["address_line1"])
+
+                        if address.get("address_line2"):
+                            st.write(address["address_line2"])
+
+                        if address.get("landmark"):
+                            st.caption(f"Landmark: {address['landmark']}")
+
+                        st.write(
+                            f"{address['city']}, {address['state']} "
+                            f"{address['postal_code']}"
+                        )
+                        st.caption(address["country"])
+
+                        with st.form(f"edit_address_form_{address_id}"):
+                            st.markdown("**Edit this address**")
+
+                            edit_label = st.text_input(
+                                "Address label",
+                                value=address["label"],
+                                key=f"edit_label_{address_id}",
+                            )
+                            edit_recipient = st.text_input(
+                                "Recipient name",
+                                value=address["recipient_name"],
+                                key=f"edit_recipient_{address_id}",
+                            )
+                            edit_phone = st.text_input(
+                                "Contact phone",
+                                value=address["phone"],
+                                key=f"edit_phone_{address_id}",
+                            )
+                            edit_line1 = st.text_input(
+                                "Address line 1",
+                                value=address["address_line1"],
+                                key=f"edit_line1_{address_id}",
+                            )
+                            edit_line2 = st.text_input(
+                                "Address line 2",
+                                value=address.get("address_line2") or "",
+                                key=f"edit_line2_{address_id}",
+                            )
+                            edit_landmark = st.text_input(
+                                "Landmark",
+                                value=address.get("landmark") or "",
+                                key=f"edit_landmark_{address_id}",
+                            )
+                            edit_city = st.text_input(
+                                "City",
+                                value=address["city"],
+                                key=f"edit_city_{address_id}",
+                            )
+                            edit_state = st.text_input(
+                                "State",
+                                value=address["state"],
+                                key=f"edit_state_{address_id}",
+                            )
+                            edit_postal = st.text_input(
+                                "Postal code",
+                                value=address["postal_code"],
+                                key=f"edit_postal_{address_id}",
+                            )
+                            edit_country = st.text_input(
+                                "Country",
+                                value=address["country"],
+                                key=f"edit_country_{address_id}",
+                            )
+                            edit_default = st.checkbox(
+                                "Make this my default address",
+                                value=bool(address["is_default"]),
+                                key=f"edit_default_{address_id}",
+                            )
+
+                            save_address = st.form_submit_button(
+                                "Save address",
+                                use_container_width=True,
+                            )
+
+                        if save_address:
+                            address_payload = {
+                                "label": edit_label,
+                                "recipient_name": edit_recipient,
+                                "phone": edit_phone,
+                                "address_line1": edit_line1,
+                                "address_line2": edit_line2 or None,
+                                "landmark": edit_landmark or None,
+                                "city": edit_city,
+                                "state": edit_state,
+                                "postal_code": edit_postal,
+                                "country": edit_country,
+                                "is_default": edit_default,
+                            }
+
+                            try:
+                                update_response = requests.put(
+                                    f"{backend_url}/customers/addresses/{address_id}",
+                                    json=address_payload,
+                                    headers={
+                                        "Authorization": f"Bearer {customer_token}"
+                                    },
+                                    timeout=15,
+                                )
+
+                                if update_response.ok:
+                                    refresh_customer_addresses()
+                                    st.success("Address updated.")
+                                    st.rerun()
+                                else:
+                                    st.error(
+                                        _customer_error_detail(
+                                            update_response,
+                                            "Could not update this address.",
+                                        )
+                                    )
+                            except requests.RequestException as exc:
+                                st.error(f"Address update failed: {exc}")
+
+                        if st.button(
+                            "Delete address",
+                            key=f"delete_address_{address_id}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                delete_response = requests.delete(
+                                    f"{backend_url}/customers/addresses/{address_id}",
+                                    headers={
+                                        "Authorization": f"Bearer {customer_token}"
+                                    },
+                                    timeout=15,
+                                )
+
+                                if delete_response.ok:
+                                    refresh_customer_addresses()
+                                    st.success("Address deleted.")
+                                    st.rerun()
+                                else:
+                                    st.error(
+                                        _customer_error_detail(
+                                            delete_response,
+                                            "Could not delete this address.",
+                                        )
+                                    )
+                            except requests.RequestException as exc:
+                                st.error(f"Address deletion failed: {exc}")
+            elif addresses == []:
+                st.info("You haven't saved a delivery address yet.")
+
+            with st.expander("➕ Add a delivery address"):
+                with st.form("add_customer_address_form"):
+                    new_label = st.selectbox(
+                        "Address label",
+                        ["Home", "Work", "Other"],
+                    )
+                    new_recipient = st.text_input("Recipient name")
+                    new_phone = st.text_input("Contact phone")
+                    new_line1 = st.text_input("Address line 1")
+                    new_line2 = st.text_input("Address line 2")
+                    new_landmark = st.text_input("Landmark")
+                    new_city = st.text_input("City")
+                    new_state = st.text_input("State")
+                    new_postal = st.text_input("Postal code")
+                    new_country = st.text_input("Country", value="India")
+                    new_default = st.checkbox(
+                        "Make this my default address",
+                        value=not bool(addresses),
+                    )
+
+                    add_address = st.form_submit_button(
+                        "Add address",
+                        use_container_width=True,
+                    )
+
+                if add_address:
+                    address_payload = {
+                        "label": new_label,
+                        "recipient_name": new_recipient,
+                        "phone": new_phone,
+                        "address_line1": new_line1,
+                        "address_line2": new_line2 or None,
+                        "landmark": new_landmark or None,
+                        "city": new_city,
+                        "state": new_state,
+                        "postal_code": new_postal,
+                        "country": new_country,
+                        "is_default": new_default,
+                    }
+
+                    try:
+                        create_response = requests.post(
+                            f"{backend_url}/customers/addresses",
+                            json=address_payload,
+                            headers={
+                                "Authorization": f"Bearer {customer_token}"
+                            },
+                            timeout=15,
+                        )
+
+                        if create_response.status_code == 201:
+                            refresh_customer_addresses()
+                            st.success("Delivery address saved.")
+                            st.rerun()
+                        else:
+                            st.error(
+                                _customer_error_detail(
+                                    create_response,
+                                    "Could not save this address.",
+                                )
+                            )
+                    except requests.RequestException as exc:
+                        st.error(f"Address creation failed: {exc}")
+
+
+            st.divider()
+            if st.button(
+                "Sign out",
+                key="customer_sign_out_button",
+                use_container_width=True,
+            ):
+                _sign_out_customer(cookie_manager, backend_url)
+                st.rerun()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2838,409 +3267,6 @@ if (
         "After selecting a shop, run the normal inventory validation "
         "before explicitly confirming an order."
     )
-
-# Customer account menu — profile and saved delivery addresses
-# ------------------------------------------------------------
-customer_token = st.session_state.get("customer_access_token")
-customer_profile = st.session_state.get("customer_profile") or {}
-
-# Login returns a compact profile; fetch the complete profile once per token.
-if (
-    customer_token
-    and st.session_state.get("customer_profile_details_loaded_token")
-    != customer_token
-):
-    try:
-        complete_profile_response = requests.get(
-            f"{backend_url}/customers/me",
-            headers={
-                "Authorization": f"Bearer {customer_token}"
-            },
-            timeout=15,
-        )
-
-        if complete_profile_response.ok:
-            customer_profile = complete_profile_response.json()
-            st.session_state.customer_profile = customer_profile
-            st.session_state.customer_profile_details_loaded_token = (
-                customer_token
-            )
-        elif complete_profile_response.status_code == 401:
-            _clear_customer_session()
-            st.error("Your session expired. Please sign in again.")
-            st.rerun()
-        else:
-            st.warning("Some profile details could not be loaded.")
-
-    except requests.RequestException:
-        st.warning("Could not refresh your customer profile.")
-
-customer_profile = st.session_state.get("customer_profile") or {}
-customer_id = customer_profile.get("customer_id")
-if customer_token:
-    with st.popover("👤 My Account"):
-        st.markdown("### Customer profile")
-        st.caption(customer_profile.get("email", ""))
-
-        with st.form("customer_profile_update_form"):
-            updated_name = st.text_input(
-                "Full name",
-                value=customer_profile.get("full_name", ""),
-                max_chars=150,
-            )
-            updated_phone = st.text_input(
-                "Phone number",
-                value=customer_profile.get("phone") or "",
-                max_chars=20,
-            )
-            language_options = {
-                "English (India)": "en-IN",
-                "Telugu (India)": "te-IN",
-                "Hindi (India)": "hi-IN",
-                "Tamil (India)": "ta-IN",
-                "Kannada (India)": "kn-IN",
-                "Malayalam (India)": "ml-IN",
-            }
-            current_language = customer_profile.get(
-                "preferred_language", "en-IN"
-            )
-            language_labels = list(language_options.keys())
-            selected_language = next(
-                (
-                    label
-                    for label, code in language_options.items()
-                    if code == current_language
-                ),
-                "English (India)",
-            )
-            chosen_language = st.selectbox(
-                "Preferred language",
-                options=language_labels,
-                index=language_labels.index(selected_language),
-            )
-
-            save_profile = st.form_submit_button(
-                "Save profile",
-                use_container_width=True,
-            )
-
-        if save_profile:
-            try:
-                profile_response = requests.patch(
-                    f"{backend_url}/customers/me",
-                    json={
-                        "full_name": updated_name,
-                        "phone": updated_phone.strip() or None,
-                        "preferred_language": language_options[chosen_language],
-                    },
-                    headers={
-                        "Authorization": f"Bearer {customer_token}"
-                    },
-                    timeout=15,
-                )
-
-                if profile_response.ok:
-                    st.session_state.customer_profile = (
-                        profile_response.json()
-                    )
-                    st.success("Your profile has been updated.")
-                    st.rerun()
-                else:
-                    st.error(
-                        _customer_error_detail(
-                            profile_response,
-                            "Could not update your profile.",
-                        )
-                    )
-            except requests.RequestException as exc:
-                st.error(f"Profile update failed: {exc}")
-
-        st.divider()
-        st.markdown("### Saved delivery addresses")
-
-        # Keep the address cache tied to the currently signed-in customer.
-        if (
-            st.session_state.get("customer_addresses_customer_id")
-            != customer_id
-        ):
-            st.session_state.customer_addresses_customer_id = customer_id
-            st.session_state.customer_addresses = None
-
-        if st.session_state.get("customer_addresses") is None:
-            try:
-                address_response = requests.get(
-                    f"{backend_url}/customers/addresses",
-                    headers={
-                        "Authorization": f"Bearer {customer_token}"
-                    },
-                    timeout=15,
-                )
-
-                if address_response.ok:
-                    st.session_state.customer_addresses = (
-                        address_response.json()
-                    )
-                elif address_response.status_code == 401:
-                    _clear_customer_session()
-                    st.error("Your session expired. Please sign in again.")
-                    st.rerun()
-                else:
-                    st.error(
-                        _customer_error_detail(
-                            address_response,
-                            "Could not load saved addresses.",
-                        )
-                    )
-            except requests.RequestException as exc:
-                st.error(f"Address loading failed: {exc}")
-
-        def refresh_customer_addresses():
-            try:
-                response = requests.get(
-                    f"{backend_url}/customers/addresses",
-                    headers={
-                        "Authorization": f"Bearer {customer_token}"
-                    },
-                    timeout=15,
-                )
-                response.raise_for_status()
-                st.session_state.customer_addresses = response.json()
-
-            except (requests.RequestException, ValueError):
-                # The address mutation may have succeeded even if refreshing fails.
-                # Clear the cache so the next rerun attempts to load the latest data.
-                st.session_state.customer_addresses = None
-
-        addresses = st.session_state.get("customer_addresses")
-
-        if addresses:
-            for address in addresses:
-                address_id = address["address_id"]
-
-                with st.expander(
-                    f"{address['label']} "
-                    + ("⭐ Default address" if address["is_default"] else "")
-                ):
-                    st.write(f"**{address['recipient_name']}**")
-                    st.write(address["phone"])
-                    st.write(address["address_line1"])
-
-                    if address.get("address_line2"):
-                        st.write(address["address_line2"])
-
-                    if address.get("landmark"):
-                        st.caption(f"Landmark: {address['landmark']}")
-
-                    st.write(
-                        f"{address['city']}, {address['state']} "
-                        f"{address['postal_code']}"
-                    )
-                    st.caption(address["country"])
-
-                    with st.form(f"edit_address_form_{address_id}"):
-                        st.markdown("**Edit this address**")
-
-                        edit_label = st.text_input(
-                            "Address label",
-                            value=address["label"],
-                            key=f"edit_label_{address_id}",
-                        )
-                        edit_recipient = st.text_input(
-                            "Recipient name",
-                            value=address["recipient_name"],
-                            key=f"edit_recipient_{address_id}",
-                        )
-                        edit_phone = st.text_input(
-                            "Contact phone",
-                            value=address["phone"],
-                            key=f"edit_phone_{address_id}",
-                        )
-                        edit_line1 = st.text_input(
-                            "Address line 1",
-                            value=address["address_line1"],
-                            key=f"edit_line1_{address_id}",
-                        )
-                        edit_line2 = st.text_input(
-                            "Address line 2",
-                            value=address.get("address_line2") or "",
-                            key=f"edit_line2_{address_id}",
-                        )
-                        edit_landmark = st.text_input(
-                            "Landmark",
-                            value=address.get("landmark") or "",
-                            key=f"edit_landmark_{address_id}",
-                        )
-                        edit_city = st.text_input(
-                            "City",
-                            value=address["city"],
-                            key=f"edit_city_{address_id}",
-                        )
-                        edit_state = st.text_input(
-                            "State",
-                            value=address["state"],
-                            key=f"edit_state_{address_id}",
-                        )
-                        edit_postal = st.text_input(
-                            "Postal code",
-                            value=address["postal_code"],
-                            key=f"edit_postal_{address_id}",
-                        )
-                        edit_country = st.text_input(
-                            "Country",
-                            value=address["country"],
-                            key=f"edit_country_{address_id}",
-                        )
-                        edit_default = st.checkbox(
-                            "Make this my default address",
-                            value=bool(address["is_default"]),
-                            key=f"edit_default_{address_id}",
-                        )
-
-                        save_address = st.form_submit_button(
-                            "Save address",
-                            use_container_width=True,
-                        )
-
-                    if save_address:
-                        address_payload = {
-                            "label": edit_label,
-                            "recipient_name": edit_recipient,
-                            "phone": edit_phone,
-                            "address_line1": edit_line1,
-                            "address_line2": edit_line2 or None,
-                            "landmark": edit_landmark or None,
-                            "city": edit_city,
-                            "state": edit_state,
-                            "postal_code": edit_postal,
-                            "country": edit_country,
-                            "is_default": edit_default,
-                        }
-
-                        try:
-                            update_response = requests.put(
-                                f"{backend_url}/customers/addresses/{address_id}",
-                                json=address_payload,
-                                headers={
-                                    "Authorization": f"Bearer {customer_token}"
-                                },
-                                timeout=15,
-                            )
-
-                            if update_response.ok:
-                                refresh_customer_addresses()
-                                st.success("Address updated.")
-                                st.rerun()
-                            else:
-                                st.error(
-                                    _customer_error_detail(
-                                        update_response,
-                                        "Could not update this address.",
-                                    )
-                                )
-                        except requests.RequestException as exc:
-                            st.error(f"Address update failed: {exc}")
-
-                    if st.button(
-                        "Delete address",
-                        key=f"delete_address_{address_id}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            delete_response = requests.delete(
-                                f"{backend_url}/customers/addresses/{address_id}",
-                                headers={
-                                    "Authorization": f"Bearer {customer_token}"
-                                },
-                                timeout=15,
-                            )
-
-                            if delete_response.ok:
-                                refresh_customer_addresses()
-                                st.success("Address deleted.")
-                                st.rerun()
-                            else:
-                                st.error(
-                                    _customer_error_detail(
-                                        delete_response,
-                                        "Could not delete this address.",
-                                    )
-                                )
-                        except requests.RequestException as exc:
-                            st.error(f"Address deletion failed: {exc}")
-        elif addresses == []:
-            st.info("You haven't saved a delivery address yet.")
-
-        with st.expander("➕ Add a delivery address"):
-            with st.form("add_customer_address_form"):
-                new_label = st.selectbox(
-                    "Address label",
-                    ["Home", "Work", "Other"],
-                )
-                new_recipient = st.text_input("Recipient name")
-                new_phone = st.text_input("Contact phone")
-                new_line1 = st.text_input("Address line 1")
-                new_line2 = st.text_input("Address line 2")
-                new_landmark = st.text_input("Landmark")
-                new_city = st.text_input("City")
-                new_state = st.text_input("State")
-                new_postal = st.text_input("Postal code")
-                new_country = st.text_input("Country", value="India")
-                new_default = st.checkbox(
-                    "Make this my default address",
-                    value=not bool(addresses),
-                )
-
-                add_address = st.form_submit_button(
-                    "Add address",
-                    use_container_width=True,
-                )
-
-            if add_address:
-                address_payload = {
-                    "label": new_label,
-                    "recipient_name": new_recipient,
-                    "phone": new_phone,
-                    "address_line1": new_line1,
-                    "address_line2": new_line2 or None,
-                    "landmark": new_landmark or None,
-                    "city": new_city,
-                    "state": new_state,
-                    "postal_code": new_postal,
-                    "country": new_country,
-                    "is_default": new_default,
-                }
-
-                try:
-                    create_response = requests.post(
-                        f"{backend_url}/customers/addresses",
-                        json=address_payload,
-                        headers={
-                            "Authorization": f"Bearer {customer_token}"
-                        },
-                        timeout=15,
-                    )
-
-                    if create_response.status_code == 201:
-                        refresh_customer_addresses()
-                        st.success("Delivery address saved.")
-                        st.rerun()
-                    else:
-                        st.error(
-                            _customer_error_detail(
-                                create_response,
-                                "Could not save this address.",
-                            )
-                        )
-                except requests.RequestException as exc:
-                    st.error(f"Address creation failed: {exc}")
-
-
-    if st.button(
-        "Sign out",
-        key="customer_sign_out_button",
-    ):
-        _sign_out_customer(cookie_manager, backend_url)
-        st.rerun()
 
 st.markdown("### Confirm your order")
 st.caption(
