@@ -49,7 +49,33 @@ st.markdown(
     <style>
     /* VoiceKirana layout styling.
        Colors are controlled by .streamlit/config.toml. */
+    /* VoiceKirana ambient page background */
 
+    .stApp {
+        background-image:
+            radial-gradient(
+                ellipse 75% 55% at 0% 0%,
+                rgba(22, 101, 52, 0.12),
+                transparent 70%
+            ),
+            radial-gradient(
+                ellipse 60% 45% at 100% 8%,
+                rgba(219, 173, 83, 0.13),
+                transparent 72%
+            ),
+            radial-gradient(
+                ellipse 75% 60% at 50% 100%,
+                rgba(22, 101, 52, 0.07),
+                transparent 72%
+            );
+        background-attachment: fixed;
+    }
+
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    [data-testid="stHeader"] {
+        background: transparent !important;
+    }
     .block-container {
         max-width: 1180px;
         padding-top: 1.8rem;
@@ -1853,10 +1879,10 @@ st.subheader("🛒 Grocery order")
 # ---------------------------------------------------------
 
 with st.container(border=True):
-    st.markdown("### Browse grocery products")
+    st.markdown("### Find your groceries")
     st.caption(
-        "Search products across all customer-visible shops, or open "
-        "a shop catalogue when you want to browse its products."
+        "Search customer-visible shops, compare live shop offers, and add "
+        "products to your cart."
     )
 
     try:
@@ -1941,13 +1967,21 @@ with st.container(border=True):
     if browse_mode == "All shops":
         st.markdown("#### Search products across shops")
 
+        def clear_global_catalogue_quick_filter():
+            st.session_state["global_catalogue_quick_filter"] = None
+
+        def select_global_catalogue_quick_filter(filter_name):
+            st.session_state["global_catalogue_quick_filter"] = filter_name
+            st.session_state["global_catalogue_search"] = ""
+
         search_col, browse_col = st.columns([3, 2])
 
         with search_col:
             search_term = st.text_input(
                 "Search products",
-                placeholder="e.g. rice, milk, sunflower oil",
+                placeholder="Search rice, milk, oil, brands...",
                 key="global_catalogue_search",
+                on_change=clear_global_catalogue_quick_filter,
             ).strip().casefold()
 
         with browse_col:
@@ -1971,9 +2005,10 @@ with st.container(border=True):
                 ] = not expanded
 
         try:
-            global_catalogue = fetch_public_global_catalogue(
-                backend_url
-            )
+            with st.spinner("Loading grocery products..."):
+                global_catalogue = fetch_public_global_catalogue(
+                    backend_url
+                )
         except (requests.RequestException, ValueError) as exc:
             st.error(
                 "Could not load the combined catalogue. "
@@ -1983,35 +2018,119 @@ with st.container(border=True):
 
         global_products = global_catalogue["products"]
         visible_shop_count = global_catalogue["shop_count"]
+        if not global_products:
+            st.info(
+                "No grocery products are currently listed by "
+                "customer-visible shops. Please check back later."
+            )
+        # These are search shortcuts, not stored product categories.
+        # A shortcut is shown only when the live catalogue has a match.
+        quick_searches = (
+            ("Rice & grains", ("rice", "biyyam", "wheat", "ragi", "millet", "millets", "grain", "grains", "jowar", "bajra", "oats")),
+            ("Flour & atta", ("atta", "flour", "maida", "besan")),
+            ("Pulses", ("dal", "dhal", "lentil", "lentils", "chana", "chickpea", "chickpeas", "moong", "toor", "urad", "urad dal", "rajma")),
+            ("Cooking oil", ("oil",)),
+            ("Dairy", ("milk", "curd", "yogurt", "yogurts", "yoghurt", "yoghurts", "paneer", "butter", "cheese", "ghee")),
+            ("Fruits & vegetables", ("fruit", "fruits", "vegetable", "vegetables", "tomato", "tomatoes", "potato", "potatoes", "onion", "onions", "banana", "bananas", "apple", "apples", "carrot", "carrots", "chilli", "chillies", "chilies")),
+            ("Snacks", ("snack", "snacks", "biscuit", "biscuits", "chip", "chips", "namkeen")),
+            ("Tea & coffee", ("tea", "coffee")),
+        )
+
+        def public_product_search_text(product):
+            return " ".join(
+                str(value)
+                for value in (
+                    product.get("name"),
+                    product.get("normalized_name"),
+                    product.get("brand"),
+                    product.get("variant"),
+                    product.get("base_unit"),
+                )
+                if value
+            ).casefold()
+
+        def public_product_has_term(product, term):
+            searchable_text = public_product_search_text(product)
+            for separator in ("/", "-", "_", ",", ".", "(", ")", "[", "]", ":", ";"):
+                searchable_text = searchable_text.replace(separator, " ")
+            return term in searchable_text.split()
+
+        available_quick_searches = {
+            label: terms
+            for label, terms in quick_searches
+            if any(
+                any(public_product_has_term(product, term) for term in terms)
+                for product in global_products
+            )
+        }
+
+        selected_quick_filter = st.session_state.get(
+            "global_catalogue_quick_filter"
+        )
+        if selected_quick_filter not in available_quick_searches:
+            selected_quick_filter = None
+            st.session_state["global_catalogue_quick_filter"] = None
 
         st.caption(
             f"{visible_shop_count} customer-visible shop(s) | "
             f"{len(global_products)} product group(s)"
         )
 
-        # Show matching products only after the customer searches.
-        if search_term:
+        if available_quick_searches:
+            st.markdown("**Quick searches**")
+            st.caption(
+                "Shortcuts are shown only when matching products exist in the catalogue."
+            )
+            quick_search_labels = list(available_quick_searches)
+            quick_search_columns = st.columns(min(4, len(quick_search_labels)))
+
+            for index, label in enumerate(quick_search_labels):
+                with quick_search_columns[index % len(quick_search_columns)]:
+                    st.button(
+                        label,
+                        key=f"global_quick_search_{index}",
+                        type=(
+                            "primary"
+                            if selected_quick_filter == label
+                            else "secondary"
+                        ),
+                        on_click=select_global_catalogue_quick_filter,
+                        args=(label,),
+                        use_container_width=True,
+                    )
+
+            if selected_quick_filter:
+                st.button(
+                    "Clear quick search",
+                    key="clear_global_quick_search_button",
+                    on_click=clear_global_catalogue_quick_filter,
+                )
+
+        # Show matching products after a text search or quick-search selection.
+        if search_term or selected_quick_filter:
             filtered_products = []
+            selected_terms = available_quick_searches.get(
+                selected_quick_filter,
+                (),
+            )
 
             for product in global_products:
-                searchable_text = " ".join(
-                    str(value)
-                    for value in (
-                        product.get("name"),
-                        product.get("normalized_name"),
-                        product.get("brand"),
-                        product.get("variant"),
-                        product.get("base_unit"),
+                searchable_text = public_product_search_text(product)
+                matches_search = (
+                    search_term in searchable_text
+                    if search_term
+                    else any(
+                        public_product_has_term(product, term)
+                        for term in selected_terms
                     )
-                    if value
-                ).casefold()
+                )
 
-                if search_term in searchable_text:
+                if matches_search:
                     filtered_products.append(product)
 
             st.markdown("**Search results**")
 
-            if not filtered_products:
+            if not filtered_products and global_products:
                 st.info("No matching products found. Try another search.")
 
             for product_index, product in enumerate(filtered_products):
@@ -2039,29 +2158,28 @@ with st.container(border=True):
                     )
                     if available_offers else None
                 )
+                with st.container(border=True):
+                    product_col, availability_col = st.columns([3, 2])
 
-                product_col, availability_col = st.columns([3, 2])
-
-                with product_col:
-                    st.markdown(
-                        f"**{product.get('name', 'Product')}**"
-                    )
-                    st.caption(
-                        f"{description + ' | ' if description else ''}"
-                        f"{unit}"
-                    )
-
-                with availability_col:
-                    if lowest_price is not None:
-                        st.write(
-                            f"From ₹{lowest_price:,.2f} / {unit}"
+                    with product_col:
+                        st.markdown(
+                            f"### {product.get('name', 'Product')}"
                         )
-                        st.caption(
-                            f"{len(available_offers)} available "
-                            f"shop offer(s)"
-                        )
-                    else:
-                        st.warning("Currently unavailable")
+                        if description:
+                            st.caption(description)
+                        st.caption(f"Unit: {unit}")
+
+                    with availability_col:
+                        if lowest_price is not None:
+                            st.markdown(
+                                f"**From ₹{lowest_price:,.2f}**"
+                            )
+                            st.caption(f"per {unit}")
+                            st.success(
+                                f"{len(available_offers)} available shop offer(s)"
+                            )
+                        else:
+                            st.warning("Currently unavailable")
 
                 if offers:
                     with st.expander(
@@ -2152,10 +2270,6 @@ with st.container(border=True):
                 for product_index, (product, offer) in enumerate(
                     selected_shop_products
                 ):
-                    product_col, price_col, status_col, action_col = (
-                        st.columns([4, 2, 2, 2])
-                    )
-
                     details = [
                         str(value).strip()
                         for value in (
@@ -2165,23 +2279,26 @@ with st.container(border=True):
                         if value and str(value).strip()
                     ]
 
-                    with product_col:
-                        st.write(f"**{product.get('name', 'Product')}**")
-                        st.caption(
-                            f"{' | '.join(details) + ' | ' if details else ''}"
-                            f"{product.get('base_unit', '')}"
-                        )
+                    unit = product.get("base_unit", "")
 
-                    with price_col:
-                        st.write(
-                            f"₹{float(offer['price_rupees']):,.2f}"
-                            f" / {product.get('base_unit', '')}"
-                        )
+                    with st.container(border=True):
+                        product_col, price_col = st.columns([3, 2])
 
-                    with status_col:
-                        st.success("Available")
+                        with product_col:
+                            st.markdown(
+                                f"**{product.get('name', 'Product')}**"
+                            )
+                            if details:
+                                st.caption(" | ".join(details))
+                            st.caption(f"Unit: {unit}")
 
-                    with action_col:
+                        with price_col:
+                            st.markdown(
+                                f"**₹{float(offer['price_rupees']):,.2f}**"
+                            )
+                            st.caption(f"per {unit}")
+                            st.success("Available")
+
                         offer_product = {
                             **product,
                             "product_id": offer.get("product_id"),
@@ -2196,8 +2313,6 @@ with st.container(border=True):
                                 f"global_shop_list_{product_index}_{shop_id}"
                             ),
                         )
-
-                    st.divider()
 
     else:
         st.markdown("#### Browse this shop's catalogue")
@@ -2222,10 +2337,13 @@ with st.container(border=True):
 
         if st.session_state["single_shop_catalogue_expanded"]:
             try:
-                catalogue_items = fetch_public_shop_catalogue(
-                    backend_url,
-                    shop_id,
-                )
+                with st.spinner(
+                    f"Loading {selected_shop_name}'s catalogue..."
+                ):
+                    catalogue_items = fetch_public_shop_catalogue(
+                        backend_url,
+                        shop_id,
+                    )
             except (requests.RequestException, ValueError) as exc:
                 st.error(
                     "Could not load this shop's catalogue. "
@@ -2242,10 +2360,6 @@ with st.container(border=True):
                 )
 
                 for product_index, product in enumerate(catalogue_items):
-                    product_col, price_col, status_col, action_col = (
-                        st.columns([4, 2, 2, 2])
-                    )
-
                     details = [
                         str(value).strip()
                         for value in (
@@ -2255,28 +2369,36 @@ with st.container(border=True):
                         if value and str(value).strip()
                     ]
 
-                    with product_col:
-                        st.write(f"**{product.get('name', 'Product')}**")
-                        st.caption(
-                            f"{' | '.join(details) + ' | ' if details else ''}"
-                            f"{product.get('base_unit', '')}"
-                        )
+                    unit = product.get("base_unit", "")
+                    price = product.get("price_rupees")
 
-                    with price_col:
-                        price = product.get("price_rupees")
-                        if price is not None:
-                            st.write(
-                                f"₹{float(price):,.2f} / "
-                                f"{product.get('base_unit', '')}"
+                    with st.container(border=True):
+                        product_col, price_col = st.columns([3, 2])
+
+                        with product_col:
+                            st.markdown(
+                                f"**{product.get('name', 'Product')}**"
                             )
 
-                    with status_col:
-                        if product.get("is_available"):
-                            st.success("Available")
-                        else:
-                            st.warning("Unavailable")
+                            if details:
+                                st.caption(" | ".join(details))
 
-                    with action_col:
+                            st.caption(f"Unit: {unit}")
+
+                        with price_col:
+                            if price is not None:
+                                st.markdown(
+                                    f"**₹{float(price):,.2f}**"
+                                )
+                                st.caption(f"per {unit}")
+                            else:
+                                st.caption("Price not available")
+
+                            if product.get("is_available"):
+                                st.success("Available")
+                            else:
+                                st.warning("Unavailable")
+
                         render_catalogue_quantity_control(
                             shop_id,
                             selected_shop_name,
@@ -2286,8 +2408,6 @@ with st.container(border=True):
                                 f"{product.get('product_id')}"
                             ),
                         )
-
-                    st.divider()
 
             st.caption(
                 "Prices and availability are specific to this shop. "
@@ -2300,19 +2420,28 @@ language = st.selectbox(
     key="request_language",
 )
 
+cart_populated_item_count = _active_cart_item_count()
+
 cart_title_col, add_item_col = st.columns([3, 1])
 
 with cart_title_col:
-    st.markdown("### Your cart")
-    st.caption(
-        f"{_active_cart_item_count()} item(s) "
-        "in your shopping cart"
-    )
+    st.markdown("### Your shopping cart")
+
+    if cart_populated_item_count:
+        st.caption(
+            f"{cart_populated_item_count} populated item(s) | "
+            "Review product details and quantities before continuing."
+        )
+    else:
+        st.caption(
+            "Your cart is empty. Add an item here or choose a "
+            "product from the catalogue above."
+        )
 
 with add_item_col:
     st.write("")
     st.button(
-        "Add item",
+        "＋ Add item",
         on_click=add_cart_item,
         type="secondary",
         key="add_cart_item_button",
@@ -2321,11 +2450,19 @@ with add_item_col:
 
 for item_id in list(st.session_state.cart_item_ids):
     with st.container(border=True):
+        current_item_name = str(
+            st.session_state.get(
+                f"cart_{item_id}_name", ""
+            )
+        ).strip()
+
+        item_title = current_item_name or f"Item {item_id + 1}"
+
         item_header_col, remove_col = st.columns([4, 1])
 
         with item_header_col:
-            st.markdown(f"**Item {item_id + 1}**")
-            st.caption("Product details")
+            st.markdown(f"**{item_title}**")
+            st.caption("Review or edit this grocery item")
 
         with remove_col:
             st.button(
@@ -3362,20 +3499,39 @@ with st.container(border=True):
             st.success("Your order has been confirmed automatically and saved successfully.")
         else:
             st.success("Your customer order request has been saved successfully.")
-        reference_col, status_col = st.columns(2)
+        with st.container(border=True):
+            reference_col, status_col = st.columns([3, 2])
 
-        with reference_col:
-            st.caption("ORDER REFERENCE")
-            st.markdown(f"**{saved['order_reference']}**")
+            with reference_col:
+                st.caption("ORDER REFERENCE")
+                st.markdown(
+                    f"**{saved['order_reference']}**"
+                )
 
-        with status_col:
-            st.caption("ORDER STATUS")
-            st.markdown(f"**{saved['status'].replace('_', ' ').title()}**")
+            with status_col:
+                st.caption("ORDER STATUS")
+                status_label = (
+                    str(saved.get("status", "pending"))
+                    .replace("_", " ")
+                    .title()
+                )
 
-        st.metric(
-            "Saved order total",
-            f"{rupee}{float(saved['total_rupees']):,.2f}",
-        )
+                if (
+                    saved_status == "confirmed"
+                    and saved.get("stock_reserved")
+                ):
+                    st.success(status_label)
+                elif saved_status == "rejected":
+                    st.error(status_label)
+                elif saved_status == "cancelled":
+                    st.info(status_label)
+                else:
+                    st.warning(status_label)
+
+            st.metric(
+                "Order total",
+                f"{rupee}{float(saved['total_rupees']):,.2f}",
+            )
         if saved_status == "confirmed" and saved.get("stock_reserved"):
             st.info(
                 "Stock has been reserved automatically. Your order is ready for payment; "
@@ -3490,11 +3646,17 @@ if (
                     else:
                         st.info(status_label)
 
-                st.caption(f"Shop: {shop_label}")
-                st.metric(
-                    "Order total",
-                    f"{rupee}{float(saved_order.get('total_rupees', 0)):,.2f}",
-                )
+                shop_col, total_col = st.columns([3, 2])
+
+                with shop_col:
+                    st.caption("SHOP")
+                    st.markdown(f"**{shop_label}**")
+
+                with total_col:
+                    st.metric(
+                        "Order total",
+                        f"{rupee}{float(saved_order.get('total_rupees', 0)):,.2f}",
+                    )
 
                 payment = saved_order.get("payment") or {}
                 payment_status = str(
@@ -3672,11 +3834,19 @@ if (
             else:
                 st.info(status.replace("_", " ").title())
 
-        st.caption(f"Created: {lookup_result.get('created_at', 'Unknown')}")
-        st.metric(
-            "Order total",
-            f"{rupee}{float(lookup_result.get('total_rupees', 0)):,.2f}",
-        )
+        created_col, total_col = st.columns([3, 2])
+
+        with created_col:
+            st.caption("ORDER PLACED")
+            st.write(
+                lookup_result.get("created_at", "Unknown")
+            )
+
+        with total_col:
+            st.metric(
+                "Order total",
+                f"{rupee}{float(lookup_result.get('total_rupees', 0)):,.2f}",
+            )
 
         if lookup_result.get("rejection_reason"):
             st.warning(f"Shop response: {lookup_result['rejection_reason']}")
