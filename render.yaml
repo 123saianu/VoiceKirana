@@ -33,12 +33,6 @@ services:
         sync: false
       - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
-      # Make the public HTTPS backend URL available to the frontend service.
-      - key: VOICEKIRANA_PUBLIC_API_URL
-        fromService:
-          name: voicekirana-api
-          type: web
-          envVarKey: RENDER_EXTERNAL_URL
 
   # Streamlit customer/shop frontend. It calls the backend over HTTPS.
   - type: web
@@ -58,7 +52,7 @@ services:
         fromService:
           name: voicekirana-api
           type: web
-          envVarKey: VOICEKIRANA_PUBLIC_API_URL
+          envVarKey: RENDER_EXTERNAL_URL
       - key: VOICEKIRANA_API_TOKEN
         fromService:
           name: voicekirana-api
