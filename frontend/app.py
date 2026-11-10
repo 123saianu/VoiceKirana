@@ -231,6 +231,20 @@ backend_url = os.getenv(
 ).rstrip("/")
 
 api_token = os.getenv("VOICEKIRANA_API_TOKEN")
+# Customer and shop-owner workspace switch. Each workspace keeps its own
+# authentication state; selecting one never converts the other account.
+portal_col_customer, portal_col_owner = st.columns(2)
+with portal_col_customer:
+    if st.button("Customer Shopping", key="portal_switch_customer", use_container_width=True):
+        if "portal" in st.query_params:
+            del st.query_params["portal"]
+        st.rerun()
+with portal_col_owner:
+    if st.button("Shop Owner Portal", key="portal_switch_shop_owner", use_container_width=True):
+        st.query_params["portal"] = "shop_owner"
+        st.rerun()
+
+owner_portal_active = st.query_params.get("portal") == "shop_owner"
 
 
 # VOICEKIRANA_OPENING_AUTH_GATE
@@ -255,6 +269,8 @@ for _key, _default in (
     ("order_history_result", None),
     ("order_lookup_result", None),
     ("order_lookup_customer_id", None),
+    ("owner_access_token", None),
+    ("owner_profile", None),
 ):
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -386,6 +402,316 @@ def _sign_out_customer(cookie_manager, backend_url):
     _clear_customer_session()
 
 
+# ---------------------------------------------------------
+# Shop-owner portal â€” uses the existing authenticated APIs.
+# ---------------------------------------------------------
+
+def _clear_owner_session():
+    st.session_state.owner_access_token = None
+    st.session_state.owner_profile = None
+
+
+def _owner_error_detail(response, fallback):
+    try:
+        detail = response.json().get("detail", fallback)
+    except ValueError:
+        return fallback
+
+    if isinstance(detail, dict):
+        detail = detail.get("message", detail)
+
+    return str(detail)
+
+
+def _owner_headers(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _render_shop_owner_portal():
+    st.markdown("## Shop Owner Portal")
+    st.caption("Manage incoming orders and view your shop inventory.")
+
+    owner_token = st.session_state.get("owner_access_token")
+    owner_profile = st.session_state.get("owner_profile") or {}
+
+    if not owner_token:
+        with st.container(border=True):
+            st.markdown("### Shop owner sign in")
+            with st.form("shop_owner_login_form"):
+                owner_email = st.text_input(
+                    "Owner email address",
+                    key="shop_owner_login_email",
+                ).strip()
+                owner_password = st.text_input(
+                    "Password",
+                    type="password",
+                    key="shop_owner_login_password",
+                )
+                owner_submitted = st.form_submit_button(
+                    "Sign in as shop owner",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if owner_submitted:
+                if not owner_email or not owner_password:
+                    st.warning("Enter your owner email address and password.")
+                    return
+
+                try:
+                    with st.spinner("Signing in to your shop..."):
+                        login_response = requests.post(
+                            f"{backend_url}/auth/login",
+                            json={"email": owner_email, "password": owner_password},
+                            timeout=15,
+                        )
+
+                    if not login_response.ok:
+                        st.error(
+                            f"Sign-in failed ({login_response.status_code}): "
+                            f"{_owner_error_detail(login_response, 'Check your email and password.')}"
+                        )
+                        return
+
+                    login_payload = login_response.json()
+                    access_token = login_payload.get("access_token")
+                    if not access_token or str(login_payload.get("token_type", "bearer")).casefold() != "bearer":
+                        st.error("The authentication service returned an invalid access token.")
+                        return
+
+                    profile_response = requests.get(
+                        f"{backend_url}/auth/me",
+                        headers=_owner_headers(access_token),
+                        timeout=15,
+                    )
+                    if not profile_response.ok:
+                        st.error(
+                            "Login succeeded, but the shop-owner profile could not be loaded: "
+                            f"{_owner_error_detail(profile_response, 'Profile request failed.')}"
+                        )
+                        return
+
+                    profile = profile_response.json()
+                    memberships = [
+                        shop for shop in profile.get("shops", [])
+                        if shop.get("role") in {"owner", "manager"}
+                    ]
+                    if not memberships:
+                        st.error("This account has no active shop-owner or manager membership.")
+                        return
+
+                    st.session_state.owner_access_token = access_token
+                    st.session_state.owner_profile = profile
+                    st.rerun()
+
+                except (requests.RequestException, ValueError, TypeError) as exc:
+                    st.error(f"Could not complete shop-owner sign-in: {exc}")
+        st.info("Use the shop-owner account created by the administrator. Customer accounts sign in through Customer Shopping.")
+        return
+
+    memberships = [
+        shop for shop in owner_profile.get("shops", [])
+        if shop.get("role") in {"owner", "manager"}
+    ]
+    if not memberships:
+        st.error("No active shop membership was found for this account. Please contact the administrator.")
+        if st.button("Sign out", key="owner_signout_no_membership"):
+            _clear_owner_session()
+            st.rerun()
+        return
+
+    owner_col, logout_col = st.columns([4, 1])
+    with owner_col:
+        st.write(f"Signed in as **{owner_profile.get('full_name', 'Shop owner')}**")
+        st.caption(owner_profile.get("email", ""))
+    with logout_col:
+        if st.button("Sign out", key="owner_signout_button", use_container_width=True):
+            _clear_owner_session()
+            st.rerun()
+
+    shop_labels = {
+        f"{shop.get('shop_name', 'Shop')} (ID {shop.get('shop_id')})": shop
+        for shop in memberships
+    }
+    selected_shop_label = st.selectbox(
+        "Select shop",
+        options=list(shop_labels.keys()),
+        key="owner_selected_shop_label",
+    )
+    selected_shop = shop_labels[selected_shop_label]
+    shop_id = int(selected_shop["shop_id"])
+    shop_name = selected_shop.get("shop_name", "Your shop")
+
+    st.markdown(f"### {shop_name}")
+    st.caption(f"Shop ID: {shop_id} · Access: {selected_shop.get('role', 'owner').title()}")
+
+    orders_tab, inventory_tab = st.tabs(["Incoming Orders & History", "Inventory"])
+
+    with orders_tab:
+        st.markdown("#### Orders")
+        if st.button("Refresh orders", key=f"owner_refresh_orders_{shop_id}"):
+            st.rerun()
+
+        try:
+            history_response = requests.get(
+                f"{backend_url}/orders/history",
+                params={"shop_id": shop_id},
+                headers=_owner_headers(owner_token),
+                timeout=20,
+            )
+            if history_response.status_code == 401:
+                _clear_owner_session()
+                st.warning("Your shop-owner session expired. Please sign in again.")
+                st.rerun()
+            elif not history_response.ok:
+                st.error(
+                    f"Could not load orders ({history_response.status_code}): "
+                    f"{_owner_error_detail(history_response, 'Order history request failed.')}"
+                )
+            else:
+                orders = history_response.json().get("orders", [])
+                pending_count = sum(1 for order in orders if order.get("status") == "pending")
+                accepted_count = sum(1 for order in orders if order.get("status") == "confirmed")
+                rejected_count = sum(1 for order in orders if order.get("status") == "rejected")
+                metric_cols = st.columns(3)
+                metric_cols[0].metric("Pending", pending_count)
+                metric_cols[1].metric("Accepted", accepted_count)
+                metric_cols[2].metric("Rejected", rejected_count)
+
+                if not orders:
+                    st.info("There are no orders for this shop yet. New customer orders will appear here.")
+
+                for order in orders:
+                    order_reference = str(order.get("order_reference", ""))
+                    status = str(order.get("status", "unknown")).casefold()
+                    total = float(order.get("total_rupees") or 0)
+                    with st.expander(
+                        f"{order_reference} · {status.title()} · ₹{total:,.2f}",
+                        expanded=(status == "pending"),
+                    ):
+                        st.caption(f"Created: {order.get('created_at', 'Not available')}")
+                        item_rows = []
+                        for item in order.get("items", []):
+                            product_label = str(item.get("product_name", "Product"))
+                            if item.get("brand"):
+                                product_label += f" · {item['brand']}"
+                            if item.get("variant"):
+                                product_label += f" · {item['variant']}"
+                            item_rows.append({
+                                "Product": product_label,
+                                "Quantity": f"{item.get('quantity', '')} {item.get('unit') or ''}".strip(),
+                                "Line total": f"₹{float(item.get('line_total_paise') or 0) / 100:,.2f}",
+                            })
+                        if item_rows:
+                            st.dataframe(item_rows, hide_index=True, use_container_width=True)
+                        st.write(f"**Order total: ₹{total:,.2f}**")
+
+                        if status == "pending":
+                            if st.button(
+                                "Accept order and reserve stock",
+                                key=f"owner_accept_{shop_id}_{order_reference}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    action_response = requests.post(
+                                        f"{backend_url}/orders/{quote(order_reference, safe='')}/accept",
+                                        params={"shop_id": shop_id},
+                                        headers=_owner_headers(owner_token),
+                                        timeout=20,
+                                    )
+                                    if action_response.ok:
+                                        st.success("Order accepted and inventory reserved.")
+                                        st.rerun()
+                                    elif action_response.status_code == 401:
+                                        _clear_owner_session()
+                                        st.error("Your session expired. Please sign in again.")
+                                        st.rerun()
+                                    else:
+                                        st.error(_owner_error_detail(action_response, "Could not accept this order."))
+                                except requests.RequestException as exc:
+                                    st.error(f"Accept request failed: {exc}")
+
+                            with st.form(f"owner_reject_form_{shop_id}_{order_reference}"):
+                                rejection_reason = st.text_input(
+                                    "Reason for rejection",
+                                    max_chars=500,
+                                    key=f"owner_reject_reason_{shop_id}_{order_reference}",
+                                    placeholder="For example: Requested items are unavailable.",
+                                )
+                                reject_submitted = st.form_submit_button(
+                                    "Reject order",
+                                    use_container_width=True,
+                                )
+                            if reject_submitted:
+                                if len(rejection_reason.strip()) < 3:
+                                    st.warning("Enter a rejection reason of at least 3 characters.")
+                                else:
+                                    try:
+                                        action_response = requests.post(
+                                            f"{backend_url}/orders/{quote(order_reference, safe='')}/reject",
+                                            params={"shop_id": shop_id},
+                                            json={"reason": rejection_reason.strip()},
+                                            headers=_owner_headers(owner_token),
+                                            timeout=20,
+                                        )
+                                        if action_response.ok:
+                                            st.success("Order rejected.")
+                                            st.rerun()
+                                        elif action_response.status_code == 401:
+                                            _clear_owner_session()
+                                            st.error("Your session expired. Please sign in again.")
+                                            st.rerun()
+                                        else:
+                                            st.error(_owner_error_detail(action_response, "Could not reject this order."))
+                                    except requests.RequestException as exc:
+                                        st.error(f"Rejection request failed: {exc}")
+                        elif status == "rejected" and order.get("rejection_reason"):
+                            st.warning(f"Rejection reason: {order['rejection_reason']}")
+
+        except requests.RequestException as exc:
+            st.error(f"Could not connect to the order service: {exc}")
+
+    with inventory_tab:
+        st.markdown("#### Shop inventory")
+        if st.button("Refresh inventory", key=f"owner_refresh_inventory_{shop_id}"):
+            st.rerun()
+        try:
+            inventory_response = requests.get(
+                f"{backend_url}/shops/{shop_id}/inventory",
+                headers=_owner_headers(owner_token),
+                timeout=20,
+            )
+            if inventory_response.status_code == 401:
+                _clear_owner_session()
+                st.warning("Your shop-owner session expired. Please sign in again.")
+                st.rerun()
+            elif not inventory_response.ok:
+                st.error(
+                    f"Could not load inventory ({inventory_response.status_code}): "
+                    f"{_owner_error_detail(inventory_response, 'Inventory request failed.')}"
+                )
+            else:
+                inventory_items = inventory_response.json().get("items", [])
+                st.caption(f"{len(inventory_items)} product(s) in this shop")
+                inventory_rows = [{
+                    "Product": " ".join(part for part in [item.get("name", ""), item.get("brand") or "", item.get("variant") or ""] if part),
+                    "Unit": item.get("base_unit", ""),
+                    "Price": f"₹{float(item.get('price_rupees') or 0):,.2f}",
+                    "Stock": item.get("stock_quantity", 0),
+                    "Available": "Yes" if item.get("is_available") else "No",
+                } for item in inventory_items]
+                if inventory_rows:
+                    st.dataframe(inventory_rows, hide_index=True, use_container_width=True)
+                else:
+                    st.info("No inventory products are registered for this shop yet.")
+        except requests.RequestException as exc:
+            st.error(f"Could not connect to the inventory service: {exc}")
+
+
+if owner_portal_active:
+    _render_shop_owner_portal()
+    st.stop()
 # Create a browser cookie manager for this Streamlit session.
 cookie_manager = stx.CookieManager(
     key="voicekirana_customer_cookie_manager"
